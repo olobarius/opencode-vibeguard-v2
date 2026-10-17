@@ -113,16 +113,17 @@ test("plugin: registers hooks, redacts requests, restores tool input", async () 
     const hooks = new Map()
     await plugin.setup(mockContext(dir, hooks))
 
-    assert.deepEqual(
-      [...hooks.keys()].sort(),
-      [
-        "session:compaction",
-        "session:context",
-        "session:generate",
-        "session:title",
-        "tool:execute.before",
-      ].sort(),
-    )
+    for (const name of [
+      "session:compaction",
+      "session:context",
+      "session:generate",
+      "session:title",
+      "session:http.request",
+      "session:http.response",
+      "tool:execute.before",
+    ]) {
+      assert.ok(hooks.has(name), `missing hook ${name}`)
+    }
 
     const context = hooks.get("session:context")
     const event = {
@@ -130,18 +131,18 @@ test("plugin: registers hooks, redacts requests, restores tool input", async () 
       system: [{ type: "text", text: `system ${API_KEY}` }],
       messages: [{ role: "user", content: [{ type: "text", text: `mail ${EMAIL} key ${API_KEY}` }] }],
     }
-    context(event)
+    await context(event)
     assert.match(event.system[0].text, /__VG_OPENAI_KEY_[a-f0-9]{12}__/)
     assert.match(event.messages[0].content[0].text, /__VG_EMAIL_[a-f0-9]{12}__/)
 
     const tool = hooks.get("tool:execute.before")
-    const toolEvent = { sessionID: "ses_test", input: { content: event.messages[0].content[0].text } }
-    tool(toolEvent)
+    const toolEvent = { sessionID: "ses_test", tool: "write", input: { content: event.messages[0].content[0].text } }
+    await tool(toolEvent)
     assert.ok(toolEvent.input.content.includes(EMAIL))
     assert.ok(toolEvent.input.content.includes(API_KEY))
 
-    const stringInput = { sessionID: "ses_test", input: event.messages[0].content[0].text }
-    tool(stringInput)
+    const stringInput = { sessionID: "ses_test", tool: "bash", input: event.messages[0].content[0].text }
+    await tool(stringInput)
     assert.ok(stringInput.input.includes(EMAIL))
     assert.ok(stringInput.input.includes(API_KEY))
   } finally {

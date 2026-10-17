@@ -2,91 +2,128 @@ import { existsSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { isPlainObject, parseDurationMs, stripJsonc } from "./util.js"
 
-function parseDurationMs(input) {
-  const raw = String(input ?? "").trim()
-  if (!raw) return 60 * 60 * 1000
+export const DEFAULTS = Object.freeze({
+  enabled: false,
+  debug: false,
+  placeholder_prefix: "__VG_",
+  // Block the model request when redaction throws instead of sending plaintext.
+  fail_closed: true,
+  // Add a short system note telling the model how to treat placeholders.
+  system_hint: true,
+  // Also redact the user prompt at admission (persisted transcript keeps placeholders).
+  redact_prompt: false,
+  session: { ttl: "24h", max_mappings: 100000, max_sessions: 100 },
+  patterns: {
+    keywords: [],
+    regex: [],
+    exclude: [],
+    min_secret_len: 8,
+    protected_files: [],
+    import_deny_paths: false,
+    deny_policy: "",
+  },
+  // Known secrets: exact values that are always replaced with stable, named placeholders.
+  secrets: {
+    files: ["~/.config/opencode/vibeguard.secrets", ".opencode/vibeguard.secrets"],
+    env: true,
+    opencode_auth: true,
+    commands: [],
+    variants: true,
+    min_len: 4,
+    reload_interval: "5s",
+  },
+  // Last line of defence on the raw provider payload.
+  guard: { http: "redact", websocket: true, regex: "strong" },
+  restore: {
+    // Restore placeholders in streamed model text (display / transcript).
+    response: true,
+    // Per-tool policy for receiving real secret values: allow | ask | deny. First match wins.
+    tools: { execute: "keep", webfetch: "ask", websearch: "deny", "*": "allow" },
+    // What to do when a tool input carries a placeholder that cannot be resolved: error | keep
+    unknown: "error",
+  },
+  // Native permission guard for files whose contents are secret.
+  protect: { reads: true, shell: "ask", paths: [] },
+})
 
-  const m = raw.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/)
-  if (!m) return 60 * 60 * 1000
-
-  const value = Number(m[1])
-  const unit = m[2]
-  if (!Number.isFinite(value) || value < 0) return 60 * 60 * 1000
-
-  if (unit === "ms") return value
-  if (unit === "s") return value * 1000
-  if (unit === "m") return value * 60 * 1000
-  if (unit === "h") return value * 60 * 60 * 1000
-  if (unit === "d") return value * 24 * 60 * 60 * 1000
-
-  return 60 * 60 * 1000
+function deepMerge(base, over) {
+  if (!isPlainObject(over)) return base
+  const out = { ...base }
+  for (const [k, v] of Object.entries(over)) {
+    if (v === undefined) continue
+    out[k] = isPlainObject(v) && isPlainObject(base?.[k]) ? deepMerge(base[k], v) : v
+  }
+  return out
 }
 
-function readJson(filepath) {
-  return fs
-    .readFile(filepath, "utf8")
-    .then((s) => JSON.parse(s))
-    .catch(() => null)
+function int(value, fallback) {
+  return Number.isFinite(value) && Number(value) > 0 ? Math.floor(Number(value)) : fallback
 }
 
-function normalizeConfig(raw) {
-  const cfg = raw && typeof raw === "object" ? raw : {}
-
-  const enabled = Boolean(cfg.enabled)
-  const debug = Boolean(cfg.debug)
-  const prefix = typeof cfg.placeholder_prefix === "string" && cfg.placeholder_prefix ? cfg.placeholder_prefix : "__VG_"
-
-  const session = cfg.session && typeof cfg.session === "object" ? cfg.session : {}
-  const ttlMs = parseDurationMs(session.ttl ?? "1h")
-  const maxMappings =
-    Number.isFinite(session.max_mappings) && Number(session.max_mappings) > 0 ? Number(session.max_mappings) : 100000
-  const maxSessions =
-    Number.isFinite(session.max_sessions) && Number(session.max_sessions) > 0
-      ? Math.floor(Number(session.max_sessions))
-      : 50
-
-  const patterns = cfg.patterns && typeof cfg.patterns === "object" ? cfg.patterns : {}
+export function normalizeConfig(raw) {
+  const cfg = deepMerge(DEFAULTS, isPlainObject(raw) ? raw : {})
+  // A `restore.tools` object given by the user replaces the defaults entirely.
+  if (isPlainObject(raw?.restore?.tools)) cfg.restore = { ...cfg.restore, tools: raw.restore.tools }
+  // Keep the V1-era `builtin` semantics: absent -> ["secrets"].
+  if (!("builtin" in (raw?.patterns ?? {}))) cfg.patterns = { ...cfg.patterns, builtin: ["secrets"] }
 
   return {
-    enabled,
-    debug,
-    prefix,
-    ttlMs,
-    maxMappings,
-    maxSessions,
-    patterns,
+    ...cfg,
+    enabled: Boolean(cfg.enabled),
+    debug: Boolean(cfg.debug),
+    prefix: typeof cfg.placeholder_prefix === "string" && cfg.placeholder_prefix ? cfg.placeholder_prefix : "__VG_",
+    ttlMs: parseDurationMs(cfg.session?.ttl, 24 * 3_600_000),
+    maxMappings: int(cfg.session?.max_mappings, 100000),
+    maxSessions: int(cfg.session?.max_sessions, 100),
+    reloadMs: parseDurationMs(cfg.secrets?.reload_interval, 5000),
+  }
+}
+
+async function readConfigFile(filepath) {
+  try {
+    const text = await fs.readFile(filepath, "utf8")
+    return JSON.parse(stripJsonc(text))
+  } catch (error) {
+    return { __error: String(error?.message ?? error) }
   }
 }
 
 export function getConfigCandidates(directory) {
   const dir = String(directory ?? process.cwd())
-  const home = os.homedir()
-  const globalConfig = path.join(home, ".config", "opencode", "vibeguard.config.json")
-  const projectRoot = path.join(dir, "vibeguard.config.json")
-  const projectLocal = path.join(dir, ".opencode", "vibeguard.config.json")
-
+  const xdg = process.env.XDG_CONFIG_HOME
+  const globalDir = xdg ? path.join(xdg, "opencode") : path.join(os.homedir(), ".config", "opencode")
+  const list = [
+    path.join(dir, "vibeguard.config.json"),
+    path.join(dir, "vibeguard.config.jsonc"),
+    path.join(dir, ".opencode", "vibeguard.config.json"),
+    path.join(dir, ".opencode", "vibeguard.config.jsonc"),
+    path.join(globalDir, "vibeguard.config.json"),
+    path.join(globalDir, "vibeguard.config.jsonc"),
+  ]
   const env = process.env.OPENCODE_VIBEGUARD_CONFIG
-  if (env) return [path.resolve(dir, env), projectRoot, projectLocal, globalConfig]
-
-  return [projectRoot, projectLocal, globalConfig]
+  return env ? [path.resolve(dir, env), ...list] : list
 }
 
 /**
- * Load plugin config:
- * - Missing or unparsable config: enabled=false (plugin is a no-op)
- * - Light validation only, no extra dependencies
+ * Load plugin config. First existing file wins; plugin `options` from
+ * opencode.json(c) are merged on top. Missing config means disabled (no-op).
  */
-export async function loadConfig(directory) {
-  const candidates = getConfigCandidates(directory)
-  for (const file of candidates) {
-    if (!file) continue
+export async function loadConfig(directory, options) {
+  const opts = isPlainObject(options) ? options : {}
+  const errors = []
+  for (const file of getConfigCandidates(directory)) {
     if (!existsSync(file)) continue
-    const raw = await readJson(file)
-    if (!raw) continue
-    const cfg = normalizeConfig(raw)
-    return { ...cfg, loadedFrom: file }
+    const raw = await readConfigFile(file)
+    if (raw?.__error) {
+      errors.push(`${file}: ${raw.__error}`)
+      continue
+    }
+    return { ...normalizeConfig(deepMerge(raw, opts)), loadedFrom: file, errors }
   }
-  const cfg = normalizeConfig({ enabled: false })
-  return { ...cfg, loadedFrom: "" }
+  if (Object.keys(opts).length > 0) {
+    return { ...normalizeConfig(opts), loadedFrom: "plugin options", errors }
+  }
+  return { ...normalizeConfig({ enabled: false }), loadedFrom: "", errors }
 }

@@ -1,28 +1,19 @@
 {
   "enabled": true,
   "debug": false,
-  "placeholder_prefix": "__VG_",
-  "session": {
-    "ttl": "1h",
-    "max_mappings": 100000,
-    "max_sessions": 50
+  "secrets": {
+    "files": ["~/.config/opencode/vibeguard.secrets", ".opencode/vibeguard.secrets"],
+    "env": true,
+    "opencode_auth": true
   },
   "patterns": {
-    "keywords": [
-      { "value": "my-api-key-123", "category": "API_KEY" }
-    ],
-    "regex": [
-      { "pattern": "my-internal-token-[0-9]+", "category": "INTERNAL_TOKEN" }
-    ],
-    "builtin": ["secrets", "email", "uuid"],
-    "exclude": ["example.com", "localhost", "127.0.0.1", "0.0.0.0"],
-    "max_text_chars": 500000,
-    "min_secret_len": 8,
-    "protected_files": [
-      "/home/user/.config/myapp/token",
-      "/home/user/project/.env"
-    ],
-    "import_deny_paths": true,
-    "deny_policy": ""
+    "builtin": ["secrets", "iban", "credit_card"],
+    "keywords": [{ "value": "Project Bluebird", "category": "CODENAME", "ignore_case": true, "whole_word": true }],
+    "regex": [{ "pattern": "ACME-[0-9]{8}", "category": "ACME_ID" }],
+    "exclude": ["localhost", "127.0.0.1"],
+    "import_deny_paths": false
+  },
+  "restore": {
+    "tools": { "execute": "keep", "webfetch": "ask", "websearch": "deny", "*": "allow" }
   }
 }

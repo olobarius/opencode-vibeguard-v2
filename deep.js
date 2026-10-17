@@ -1,11 +1,18 @@
 import { restoreText } from "./restore.js"
 import { redactText } from "./engine.js"
+import { isPlainObject, mapStrings } from "./util.js"
 
-function isPlainObject(value) {
-  if (!value || typeof value !== "object") return false
-  if (Array.isArray(value)) return false
-  const proto = Object.getPrototypeOf(value)
-  return proto === Object.prototype || proto === null
+/**
+ * Copy-on-write redaction: returns a new structure when something was
+ * redacted and the original reference otherwise. Prefer this over the
+ * in-place variants for hook payloads that may share objects with state.
+ */
+export function redactValue(value, patterns, session, counter) {
+  return mapStrings(value, (s) => {
+    const res = redactText(s, patterns, session)
+    if (counter && res.count) counter.count += res.count
+    return res.text
+  })
 }
 
 /**

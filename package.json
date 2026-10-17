@@ -1,7 +1,7 @@
 {
   "name": "opencode-vibeguard-v2",
-  "version": "0.3.0",
-  "description": "VibeGuard for OpenCode V2: redact secrets/PII into __VG_...__ placeholders before LLM requests, restore them before local tool execution, optional response-stream restore",
+  "version": "0.4.0",
+  "description": "VibeGuard for OpenCode V2 (2.0.32+): secrets and PII reach the LLM only as __VG_...__ placeholders; real values are restored locally for tools and in the streamed answer",
   "type": "module",
   "exports": "./index.js",
   "files": [
@@ -9,18 +9,28 @@
     "config.js",
     "deep.js",
     "engine.js",
+    "guard.js",
+    "known.js",
     "patterns.js",
+    "policy.js",
     "restore.js",
-    "session.js",
     "secrets.js",
+    "session.js",
+    "stream.js",
+    "util.js",
     "scripts/sync-deny-paths.mjs",
     "scripts/add-deny-path.mjs",
     "README.md",
     "LICENSE",
-    "vibeguard.config.json.example"
+    "vibeguard.config.json.example",
+    "vibeguard.config.jsonc.example",
+    "vibeguard.secrets.example"
   ],
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "keywords": [
     "opencode",
@@ -33,7 +43,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AxeForce/opencode-vibeguard-v2.git"
+    "url": "git+https://github.com/olobarius/opencode-vibeguard-v2.git"
   },
   "license": "MIT"
 }

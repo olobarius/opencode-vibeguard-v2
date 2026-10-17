@@ -6,124 +6,115 @@ function subtractCovered(start, end, covered) {
     if (c.end <= cur) continue
     if (c.start >= end) break
     if (c.start > cur) out.push({ start: cur, end: Math.min(c.start, end) })
-    if (c.end >= end) {
-      cur = end
-      break
-    }
     cur = Math.max(cur, c.end)
+    if (cur >= end) break
   }
   if (cur < end) out.push({ start: cur, end })
   return out
 }
 
 function insertCovered(covered, span) {
-  if (span.start >= span.end) return covered
   let i = 0
-  for (; i < covered.length; i++) {
-    if (covered[i].start > span.start) break
-  }
-  covered.splice(i, 0, span)
-  if (covered.length <= 1) return covered
-
+  while (i < covered.length && covered[i].start < span.start) i++
+  covered.splice(i, 0, { start: span.start, end: span.end })
   const merged = []
   for (const c of covered) {
     const last = merged.at(-1)
-    if (!last) {
-      merged.push(c)
-      continue
-    }
-    if (c.start <= last.end) {
+    if (last && c.start <= last.end) {
       if (c.end > last.end) last.end = c.end
-      continue
-    }
-    merged.push(c)
+    } else merged.push(c)
   }
   return merged
 }
 
+function secretSpan(m) {
+  if (m.indices?.groups) {
+    for (const name of ["secret", "secret2", "secret3"]) {
+      const span = m.indices.groups[name]
+      if (span) return span
+    }
+  }
+  return [m.index, m.index + m[0].length]
+}
+
 /**
- * Redact sensitive values in a string, returning the transformed text and matches.
- * Overlapping hits are handled so placeholders are never sliced apart (same design as VibeGuard).
- * @param {string} input
- * @param {{ keywords: Array<{value:string,category:string}>, regex: Array<{pattern:string,flags:string,category:string}>, exclude: Set<string> }} patterns
- * @param {{ getOrCreatePlaceholder(original: string, category: string): string }} session
+ * Find all sensitive spans in `text`.
+ * Order of precedence: existing placeholders (never touched) > known values > regex rules.
  */
-export function redactText(input, patterns, session) {
-  const text = String(input ?? "")
-  if (!text) return { text, matches: [] }
-
-  const maxChars =
-    Number.isFinite(patterns?.maxTextChars) && patterns.maxTextChars > 0 ? patterns.maxTextChars : 500000
-  const truncated = text.length > maxChars
-  const head = truncated ? text.slice(0, maxChars) : text
-  const tail = truncated ? text.slice(maxChars) : ""
-
-  const found = []
-
-  for (const rule of patterns.keywords) {
-    const needle = rule.value
-    if (!needle) continue
-    let idx = 0
-    for (;;) {
-      const pos = head.indexOf(needle, idx)
-      if (pos === -1) break
-      const start = pos
-      const end = pos + needle.length
-      const original = head.slice(start, end)
-      idx = end
-      if (patterns.exclude.has(original)) continue
-      found.push({ start, end, original, category: rule.category })
-    }
+export function findMatches(text, patterns, placeholderRe) {
+  let covered = []
+  if (placeholderRe) {
+    placeholderRe.lastIndex = 0
+    for (const m of text.matchAll(placeholderRe)) covered.push({ start: m.index, end: m.index + m[0].length })
   }
-
-  for (const rule of patterns.regex) {
-    const re = rule.regex
-    if (!(re instanceof RegExp)) continue
-    // matchAll on a fresh head string; reset lastIndex in case of shared /g regexes
-    re.lastIndex = 0
-    for (const m of head.matchAll(re)) {
-      if (!m[0]) continue
-      const start = m.index ?? -1
-      if (start < 0) continue
-      const end = start + m[0].length
-      const original = head.slice(start, end)
-      if (patterns.exclude.has(original)) continue
-      found.push({ start, end, original, category: rule.category })
-    }
-  }
-
-  if (found.length === 0) return { text, matches: [], truncated }
-
-  // Rightmost first; same start prefers longer, so large left-side hits get split
-  found.sort((a, b) => {
-    if (a.start !== b.start) return b.start - a.start
-    return b.end - a.end
-  })
 
   const planned = []
-  let covered = []
-  for (const m of found) {
-    const segments = subtractCovered(m.start, m.end, covered)
-    for (const seg of segments) {
-      if (seg.start < 0 || seg.end > head.length || seg.start >= seg.end) continue
-      planned.push({
-        start: seg.start,
-        end: seg.end,
-        original: head.slice(seg.start, seg.end),
-        category: m.category,
-      })
+  const add = (start, end, category, canonical) => {
+    for (const seg of subtractCovered(start, end, covered)) {
+      const whole = seg.start === start && seg.end === end
+      planned.push({ start: seg.start, end: seg.end, category, canonical: whole ? canonical : undefined })
       covered = insertCovered(covered, seg)
     }
   }
 
-  planned.sort((a, b) => b.start - a.start)
-
-  let out = head
-  for (const m of planned) {
-    const placeholder = session.getOrCreatePlaceholder(m.original, m.category)
-    out = out.slice(0, m.start) + placeholder + out.slice(m.end)
-    m.placeholder = placeholder
+  for (const matcher of patterns.keywordMatchers ?? []) {
+    matcher.regex.lastIndex = 0
+    for (const m of text.matchAll(matcher.regex)) {
+      const found = m[0]
+      const entry = matcher.map.get(matcher.ignoreCase ? found.toLowerCase() : found)
+      if (!entry || patterns.exclude.has(found)) continue
+      // Case-insensitive hits restore to the casing actually seen, so they are not "known".
+      const canonical = matcher.ignoreCase && found !== entry.value ? undefined : (entry.canonical ?? entry.value)
+      add(m.index, m.index + found.length, entry.category, canonical)
+    }
   }
 
-  return { text: out + tail, matches: planned, truncated }
+  for (const rule of patterns.regex) {
+    rule.regex.lastIndex = 0
+    for (const m of text.matchAll(rule.regex)) {
+      if (!m[0]) continue
+      const [start, end] = secretSpan(m)
+      if (start >= end) continue
+      const original = text.slice(start, end)
+      if (patterns.exclude.has(original) || patterns.exclude.has(m[0])) continue
+      if (rule.validate && !rule.validate(original, m)) continue
+      add(start, end, rule.category, undefined)
+    }
+  }
+
+  planned.sort((a, b) => a.start - b.start)
+  return planned
+}
+
+/**
+ * Redact sensitive values in a string.
+ * @returns {{ text: string, count: number }}
+ */
+export function redactText(input, patterns, session, opts) {
+  const text = typeof input === "string" ? input : String(input ?? "")
+  if (!text) return { text, count: 0 }
+  const useCache = opts?.cache !== false
+
+  const cached = useCache ? session.cacheGet?.(text, patterns) : undefined
+  if (cached !== undefined) return { text: cached.text, count: cached.count }
+
+  const planned = findMatches(text, patterns, session.placeholderRe)
+  if (planned.length === 0) {
+    if (useCache) session.cacheSet?.(text, patterns, text, 0)
+    return { text, count: 0 }
+  }
+
+  let out = ""
+  let cur = 0
+  for (const m of planned) {
+    const original = text.slice(m.start, m.end)
+    const placeholder =
+      (m.canonical !== undefined ? session.knownPlaceholder?.(m.canonical) : undefined) ??
+      session.getOrCreatePlaceholder(original, m.category)
+    out += text.slice(cur, m.start) + placeholder
+    cur = m.end
+  }
+  out += text.slice(cur)
+  if (useCache) session.cacheSet?.(text, patterns, out, planned.length)
+  return { text: out, count: planned.length }
 }

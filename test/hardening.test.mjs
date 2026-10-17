@@ -69,15 +69,14 @@ test("sessions: store evicts oldest beyond max", () => {
   assert.equal(store.get("a").id, "a", "evicted entry is recreated")
 })
 
-// Task 4b: size guard truncates huge inputs
-test("engine: huge input is bounded and flagged", () => {
+// Task 4b: huge inputs are scanned completely (the old truncation let the tail leak)
+test("engine: secrets at the end of huge input are still redacted", () => {
   const patterns = buildPatternSet({ regex: [{ pattern: "sk-[A-Za-z0-9]{48}", category: "OPENAI_KEY" }], max_text_chars: 100 })
   const session = new PlaceholderSession({ prefix: "__VG_", ttlMs: 60_000, maxMappings: 100 })
   const key = "sk-" + "A".repeat(48)
-  const big = "x".repeat(200) + key
+  const big = "x ".repeat(300_000) + key
   const res = redactText(big, patterns, session)
-  assert.equal(res.truncated, true)
-  assert.ok(res.text.length <= 200 + 64, "output stays bounded")
+  assert.ok(!res.text.includes(key))
 })
 
 // Task 5: secret file extractor

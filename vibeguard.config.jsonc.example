@@ -1,0 +1,70 @@
+// Copy to ~/.config/opencode/vibeguard.config.jsonc (global) or
+// <project>/.opencode/vibeguard.config.jsonc (project). Every key is optional
+// except "enabled"; the values below are the defaults unless noted.
+{
+  "enabled": true,
+  "debug": false, // counts-only trace in <tmp>/opencode-vibeguard-trace.log
+  "placeholder_prefix": "__VG_",
+  "fail_closed": true, // block the model request if redaction throws
+  "system_hint": true, // tell the model how to treat placeholders
+  "redact_prompt": false, // also store the user prompt with placeholders
+
+  "session": { "ttl": "24h", "max_mappings": 100000, "max_sessions": 100 },
+
+  // Known secrets: exact values, always replaced by stable named placeholders
+  // (__VG_<NAME>_<hash>__) that survive restarts. Highest-confidence source.
+  "secrets": {
+    // dotenv-style lists: NAME=value lines and bare lines (one password/term per line)
+    "files": ["~/.config/opencode/vibeguard.secrets", ".opencode/vibeguard.secrets"],
+    "env": true, // values of *_TOKEN, *_SECRET, *PASSWORD*, *_API_KEY, ... env vars
+    // or: { "include": ["MY_APP_*"], "exclude": ["CI_*"], "min_len": 8 }
+    "opencode_auth": true, // provider keys/tokens from OpenCode's auth.json
+    "commands": [
+      // password managers, run once at load; first stdout line is the secret
+      // { "name": "GITHUB_PAT", "command": ["pass", "show", "github/token"] },
+      // { "name": "VAULT", "command": ["powershell", "-NoProfile", "-Command", "Get-Secret -Name X -AsPlainText"] }
+    ],
+    "variants": true, // also match base64 / base64url / URL-encoded forms
+    "min_len": 4,
+    "reload_interval": "5s" // hot reload when a watched file changes
+  },
+
+  "patterns": {
+    // Literal values / sensitive terms. Prefer the secrets file for real secrets.
+    "keywords": [
+      // { "value": "Project Bluebird", "category": "CODENAME", "ignore_case": true, "whole_word": true }
+    ],
+    "regex": [
+      // { "pattern": "ACME-[0-9]{8}", "category": "ACME_ID" }
+      // A named group (?<secret>...) limits the redaction to that group.
+    ],
+    // "secrets" (default) = 40+ provider token formats, private keys, URL passwords,
+    // auth headers, JWTs and `password = ...` assignments.
+    // Opt-in PII: email, uuid, ipv4, mac, iban, credit_card, china_phone, china_id. "all" = everything.
+    "builtin": ["secrets", "iban", "credit_card"],
+    "exclude": ["localhost", "127.0.0.1"],
+    "min_secret_len": 8,
+    "protected_files": [], // file contents become known secrets and reads are blocked
+    "import_deny_paths": false, // also ingest cc-safety-net secret_protection.deny_paths
+    "deny_policy": "" // default ~/.cc-safety-net/policy.json
+  },
+
+  // Raw payload safety net: http.request / experimental.ws.send.
+  // "redact" (default) | "block" (abort the request instead) | "off"
+  "guard": { "http": "redact", "websocket": true, "regex": "strong" },
+
+  "restore": {
+    "response": true, // restore placeholders in streamed model text (display only)
+    // Who may receive real values. First match wins. allow | ask | deny | keep
+    "tools": {
+      "execute": "keep", // Code Mode: nested tool calls decide individually
+      "webfetch": "ask",
+      "websearch": "deny",
+      "*": "allow"
+    },
+    "unknown": "error" // tool input with an unresolvable placeholder: error | keep
+  },
+
+  // Native permission guard: deny `read`, ask on `shell` for registered secret files.
+  "protect": { "reads": true, "shell": "ask", "paths": [] }
+}
