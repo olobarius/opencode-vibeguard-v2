@@ -62,10 +62,13 @@ test("rules: generic assignments redact only the value", () => {
   assert.match(out, /^DB_PASSWORD="__VG_SECRET_[a-f0-9]{12}__"$/)
 })
 
-test("rules: bare word after a password key is still a secret", () => {
+test("rules: dictionary words and dummy passwords after a password key are left alone", () => {
   const p = buildPatternSet({})
-  const out = redactText("wlan password: sommerwiese", p, session()).text
-  assert.match(out, /^wlan password: __VG_SECRET_[a-f0-9]{12}__$/)
+  for (const line of ["wlan password: " + "sonnenschein", 'password: "changeme"', "DB_PASSWORD=" + "postgres", "Passwort: " + "Sommer"]) {
+    assert.equal(redactText(line, p, session()).text, line, line)
+  }
+  const out = redactText("wlan password: " + "sonnen" + "schein-77!", p, session()).text
+  assert.match(out, /^wlan password: __VG_[A-Z_]+_[a-f0-9]{12}__$/)
 })
 
 test("rules: generic assignments ignore code and config noise", () => {

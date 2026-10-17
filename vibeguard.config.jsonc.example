@@ -38,7 +38,16 @@
     //   "group": "VibeGuard",                       // all entries in this group (title = name)
     //   "entries": [{ "name": "DB_PASSWORD", "entry": "Dev/Database" }]
     // },
+    // Bitwarden / Vaultwarden via the bw CLI (default null = off). Unlock: node scripts/bw-unlock.mjs
+    // "bitwarden": {
+    //   "folders": ["VibeGuard"],                 // never the whole vault
+    //   "session_wincred": "vibeguard-bw-session", // where bw-unlock.mjs stores the session key
+    //   "usernames": false, "totp": true, "notes": false, "text_fields": false
+    // },
     "store": "file", // where `/vibeguard add` writes: "file" (first secrets file) or "wincred"
+    // Weak known secrets (single words, < 8 chars, top-list) are only replaced in a credential context.
+    "weak": "context", // context | word | exact | off
+    "match": {}, // per name: { "WLAN_PW": "exact", "OLD_PIN": "off" }
     "variants": true, // also match base64 / base64url / URL-encoded forms
     "min_len": 4,
     "reload_interval": "5s" // hot reload when a watched file changes
@@ -84,6 +93,22 @@
 
   // Native permission guard: deny `read`, ask on `shell` for registered secret files.
   "protect": { "reads": true, "shell": "ask", "paths": [] },
+
+  // Data sources and model endpoints (routing). Empty = off.
+  "endpoints": {
+    // "local": {
+    //   "providers": ["kk-local"],                       // provider ID globs
+    //   "models": ["*"],                                 // optional model ID globs
+    //   "base_urls": ["https://ai.example.lan:30000/*"], // verified on every request
+    //   "trusted": true                                  // no substitution at all
+    // }
+  },
+  "sources": {
+    // "exchange": { "tools": ["exchange_*"], "allow": ["local"] },
+    // "hr":       { "paths": ["C:/Users/me/Documents/HR/**"], "allow": ["local"] },
+    // "excel":    { "tools": ["excel-mcp_*"] }            // no allow = tagging/audit only
+  },
+  "routing": { "on_violation": "block", "preflight": true, "fingerprints": true },
 
   // Security event log (JSONL, rotated, never contains values).
   // Default path: ~/.local/share/opencode/vibeguard/audit.jsonl

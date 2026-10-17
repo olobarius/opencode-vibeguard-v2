@@ -19,7 +19,7 @@ function jsonForms(value) {
  */
 export function buildRawPatterns(patterns, mode) {
   const keywords = []
-  for (const e of patterns.keywords) {
+  for (const e of patterns.matchKeywords ?? patterns.keywords) {
     keywords.push(e)
     if (e.ignoreCase || e.wholeWord) continue
     for (const form of jsonForms(e.value)) keywords.push({ ...e, value: form, canonical: e.canonical ?? e.value })

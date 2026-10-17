@@ -36,12 +36,24 @@ export const DEFAULTS = Object.freeze({
     windows_credentials: [{ filter: "vibeguard:*" }],
     // KeePass/KeePassXC via keepassxc-cli: { database, password_env | password_wincred | no_password, entries, group }
     keepass: null,
+    // Bitwarden / Vaultwarden via `bw` CLI: { folders: ["VibeGuard"], session_wincred?, usernames?, notes? }
+    bitwarden: null,
     // Where `/vibeguard add` stores new secrets: file | wincred
     store: "file",
+    // Match mode for weak known secrets (single words, short, top-list): context | word | exact | off
+    weak: "context",
+    // Per-name override of the match mode: { "WLAN_PW": "exact", "OLD_PIN": "off" }
+    match: {},
     variants: true,
     min_len: 4,
     reload_interval: "5s",
   },
+  // Model endpoints: { local: { providers: ["kk-local"], base_urls: ["http://host:30000/*"], trusted: true } }
+  endpoints: {},
+  // Data sources: { exchange: { tools: ["exchange_*"], paths: [], urls: [], allow: ["local"] } }
+  sources: {},
+  // block: refuse requests with restricted data to other endpoints | withhold: replace those tool results
+  routing: { on_violation: "block", preflight: true, fingerprints: true },
   // Security event log (JSONL, rotated). Never contains secret values.
   audit: { enabled: true, path: "", max_bytes: 5 * 1024 * 1024, max_files: 3 },
   // Pipeline self-test at startup; failure blocks requests when fail_closed is on.

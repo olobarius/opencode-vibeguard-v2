@@ -27,14 +27,20 @@ function insertCovered(covered, span) {
   return merged
 }
 
-function secretSpan(m) {
-  if (m.indices?.groups) {
-    for (const name of ["secret", "secret2", "secret3"]) {
-      const span = m.indices.groups[name]
-      if (span) return span
-    }
+/**
+ * Spans to replace for one regex match: every matched `secret*` group and
+ * `user*` group, or the whole match when the rule has no such groups.
+ */
+function ruleSpans(m) {
+  const groups = m.indices?.groups
+  if (!groups) return [{ start: m.index, end: m.index + m[0].length, user: false }]
+  const out = []
+  for (const [name, span] of Object.entries(groups)) {
+    if (!span) continue
+    if (/^secret\d*$/.test(name)) out.push({ start: span[0], end: span[1], user: false })
+    else if (/^user\d*$/.test(name)) out.push({ start: span[0], end: span[1], user: true })
   }
-  return [m.index, m.index + m[0].length]
+  return out.length ? out : [{ start: m.index, end: m.index + m[0].length, user: false }]
 }
 
 /**
@@ -73,12 +79,25 @@ export function findMatches(text, patterns, placeholderRe) {
     rule.regex.lastIndex = 0
     for (const m of text.matchAll(rule.regex)) {
       if (!m[0]) continue
-      const [start, end] = secretSpan(m)
-      if (start >= end) continue
-      const original = text.slice(start, end)
+      const spans = ruleSpans(m).filter((s) => s.start < s.end)
+      if (spans.length === 0) continue
+      const primary = spans.find((s) => !s.user) ?? spans[0]
+      const original = text.slice(primary.start, primary.end)
       if (patterns.exclude.has(original) || patterns.exclude.has(m[0])) continue
       if (rule.validate && !rule.validate(original, m)) continue
-      add(start, end, rule.category, undefined)
+      const keepUser = !rule.userFilter || rule.userFilter(m)
+      for (const s of spans) {
+        if (s.user && !keepUser) continue
+        const value = text.slice(s.start, s.end)
+        if (patterns.exclude.has(value)) continue
+        if (rule.resolve) {
+          const r = rule.resolve(value)
+          if (!r) continue
+          add(s.start, s.end, r.category, r.canonical)
+        } else {
+          add(s.start, s.end, s.user ? rule.userCategory : rule.category, undefined)
+        }
+      }
     }
   }
 

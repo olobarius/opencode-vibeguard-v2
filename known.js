@@ -3,6 +3,8 @@ import { readFile, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { sanitizeCategory } from "./patterns.js"
+import { bitwardenSecrets } from "./bitwarden.js"
+import { assessSecret, resolveMode } from "./credentials.js"
 import { keepassSecrets } from "./keepass.js"
 import { loadProtectedKeywords, readDenyPaths } from "./secrets.js"
 import { windowsCredentialSecrets } from "./wincred.js"
@@ -188,7 +190,12 @@ export async function collectKnownSecrets(config, directory, opts = {}) {
   //    KeePass. Cached between hot reloads; refreshed at setup and `/vibeguard reload`.
   let slow = opts.slowCache
   if (!slow || opts.refreshSlow) {
-    slow = { commands: [], windows_credentials: [], keepass: [], failed: [] }
+    slow = { commands: [], windows_credentials: [], keepass: [], bitwarden: [], failed: [] }
+    if (secrets.bitwarden) {
+      const res = await (opts.bitwarden ?? bitwardenSecrets)(secrets.bitwarden)
+      slow.bitwarden = res.entries
+      slow.failed.push(...res.failed)
+    }
     if (Array.isArray(secrets.commands) && secrets.commands.length > 0) {
       const res = await commandSecrets(secrets.commands)
       slow.commands = res.entries
@@ -207,6 +214,7 @@ export async function collectKnownSecrets(config, directory, opts = {}) {
   }
   push("windows_credentials", slow.windows_credentials)
   push("keepass", slow.keepass)
+  push("bitwarden", slow.bitwarden ?? [])
   push("commands", slow.commands)
   failed.push(...slow.failed)
   if (secrets.keepass?.database) protectedPaths.push(expandPath(secrets.keepass.database, directory))
@@ -214,22 +222,31 @@ export async function collectKnownSecrets(config, directory, opts = {}) {
   const exclude = new Set((Array.isArray(patterns.exclude) ? patterns.exclude : []).map(String))
   const seen = new Set()
   const entries = []
+  const overrides = {}
+  for (const [k, v] of Object.entries(isPlainObject(secrets.match) ? secrets.match : {})) overrides[sanitizeCategory(k)] = String(v).toLowerCase()
   for (const e of all) {
     if (!e?.value || seen.has(e.value) || exclude.has(e.value)) continue
     seen.add(e.value)
-    entries.push({ value: e.value, category: sanitizeCategory(e.category), source: e.source })
+    const category = sanitizeCategory(e.category)
+    const { strength, reasons } = assessSecret(e.value)
+    const entry = { value: e.value, category, source: e.source, strength, reasons }
+    entry.mode = resolveMode({ ...entry, mode: e.mode }, overrides, secrets.weak)
+    entries.push(entry)
   }
   const named = entries.length
   if (secrets.variants !== false) {
     for (const e of entries.slice(0, named)) {
+      // Encoded forms only for values that are replaced as tokens; weak values stay in context.
+      if (e.mode !== "exact" && e.mode !== "word") continue
       for (const [variant, suffix] of secretVariants(e.value)) {
         if (seen.has(variant)) continue
         seen.add(variant)
-        entries.push({ value: variant, category: `${e.category}_${suffix}`, source: e.source, variant: true })
+        entries.push({ value: variant, category: `${e.category}_${suffix}`, source: e.source, variant: true, mode: "exact", strength: "strong", reasons: [] })
       }
     }
   }
   counts.total = entries.length
+  counts.weak = entries.filter((e) => !e.variant && e.strength === "weak").length
   return { entries, named, watch: [...new Set(watch)], failed, protectedPaths: [...new Set(protectedPaths)], counts, slow }
 }
 

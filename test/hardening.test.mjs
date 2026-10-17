@@ -18,7 +18,7 @@ const ANTHROPIC = "sk-ant-" + "B".repeat(32)
 test("defaults: secret patterns apply without explicit builtin", () => {
   const patterns = buildPatternSet({})
   const session = new PlaceholderSession({ prefix: "__VG_", ttlMs: 60_000, maxMappings: 100 })
-  for (const secret of [AKIA, GH, ANTHROPIC, "postgres://u:secret123@host/db"]) {
+  for (const secret of [AKIA, GH, ANTHROPIC, "postgres://u:Q9x!vT2#mK@host/db"]) {
     const out = redactText(`value ${secret} end`, patterns, session).text
     assert.ok(!out.includes(secret), `should redact ${secret.slice(0, 8)}...`)
   }

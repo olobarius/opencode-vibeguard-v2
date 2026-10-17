@@ -57,7 +57,7 @@ export function extractNamedSecrets(text, opts) {
   const allowBare = opts?.bare !== false
   const out = []
   const seen = new Set()
-  const push = (name, raw, quotedOk) => {
+  const push = (name, raw, quotedOk, mode) => {
     const value = quotedOk ? raw : parseValue(raw)
     if (value.length < minLen) return
     if (/[\r\n]/.test(value)) return
@@ -65,16 +65,19 @@ export function extractNamedSecrets(text, opts) {
     if (PLACEHOLDER_WORDS.has(value.toLowerCase())) return
     if (seen.has(value)) return
     seen.add(value)
-    out.push({ name: name ? sanitizeCategory(name) : null, value })
+    const entry = { name: name ? sanitizeCategory(name) : null, value }
+    if (mode) entry.mode = mode
+    out.push(entry)
   }
 
   for (const rawLine of stripBom(text).split(/\r?\n/)) {
     const line = rawLine.trim()
     if (!line || line.startsWith("#") || line.startsWith("//") || line.startsWith(";")) continue
-    const kv = line.match(/^(?:export\s+)?["']?([A-Za-z_][A-Za-z0-9_.\-]*)["']?\s*(=|:)\s*(.*)$/)
+    // NAME=value, NAME[exact|word|context|off]=value, export NAME=value, NAME: value
+    const kv = line.match(/^(?:export\s+)?["']?([A-Za-z_][A-Za-z0-9_.\-]*)["']?(?:\[(exact|word|context|off)\])?\s*(=|:)\s*(.*)$/i)
     if (kv) {
-      if (kv[3] === "" || kv[3] === "{" || kv[3] === "[") continue
-      push(kv[1], kv[3], false)
+      if (kv[4] === "" || kv[4] === "{" || kv[4] === "[") continue
+      push(kv[1], kv[4], false, kv[2]?.toLowerCase())
       continue
     }
     if (line.startsWith("{") || line.startsWith("[") || line.startsWith("}") || line.startsWith("]")) continue
@@ -111,10 +114,10 @@ export async function loadProtectedKeywords(files, opts) {
       const text = await readFile(path, "utf8")
       read.push(path)
       const sliced = text.length > maxBytes ? text.slice(0, maxBytes) : text
-      for (const { name, value } of extractNamedSecrets(sliced, opts)) {
+      for (const { name, value, mode } of extractNamedSecrets(sliced, opts)) {
         if (seen.has(value)) continue
         seen.add(value)
-        keywords.push({ value, category: name ?? fallback })
+        keywords.push(mode ? { value, category: name ?? fallback, mode } : { value, category: name ?? fallback })
       }
     } catch (error) {
       failed.push({ file: path, code: error?.code, message: String(error?.message ?? error) })

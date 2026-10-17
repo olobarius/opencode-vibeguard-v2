@@ -1,4 +1,6 @@
 import { escapeRegex } from "./util.js"
+import { CREDENTIAL_RULES, buildContextRule } from "./credentials.js"
+import { DUMMY_FRAGMENT, looksLikeIdentifier, looksLikeMemberExpr, looksLikeReference, shannon, validateAssignedValue } from "./validators.js"
 
 const R = String.raw
 
@@ -26,55 +28,16 @@ function peelInlineFlags(pattern, flags) {
 // Validators (reduce false positives of the context-based rules)
 // ---------------------------------------------------------------------------
 
-const CODE_WORDS = new Set(
-  (
-    "string str number int integer float bool boolean any unknown null nil none undefined true false object " +
-    "optional required text password passwd pass pwd secret secrets token tokens apikey api_key key credential " +
-    "credentials changeme change_me example sample placeholder dummy redacted masked hidden empty default test " +
-    "testing todo tbd value values input data config settings params props args kwargs req request res response " +
-    "ctx context field fields type types function async await new return self this env environment yes no on off"
-  ).split(" "),
-)
-
-function looksLikeReference(v) {
-  return (
-    /^(?:\$\{?|%\(|\{\{|<[^>]*>$|\[\[|process\.env|os\.environ|env\(|getenv|import\.meta|secrets\.|vars\.|ENV\[|System\.getenv)/i.test(v) ||
-    /^(?:x{3,}|\*{3,}|\.{3,}|-{3,}|•{3,}|_{3,}|#{3,})$/i.test(v) ||
-    /^(?:your|my|enter|insert|replace|put|add)[-_ ]?(?:own[-_ ]?)?(?:api|secret|token|key|password|pass|value)/i.test(v) ||
-    /\b(?:changeme|replace[-_]?me|placeholder|redacted|example)\b/i.test(v)
-  )
-}
-
-/** Value validator for `key = value` style rules. */
-function validateAssignedValue(value, quoted) {
-  const v = String(value ?? "").trim()
-  if (v.length < 4) return false
-  if (v.includes("__VG_")) return false
-  if (CODE_WORDS.has(v.toLowerCase())) return false
-  if (looksLikeReference(v)) return false
-  if (/^\d{1,7}$/.test(v)) return false
-  if (/^[A-Za-z_$][\w$]*\s*\(/.test(v)) return false
-  if (!quoted) {
-    if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(v)) return false // member expression
-    if (/^[a-z]+(?:[A-Z][a-z0-9]*)+$/.test(v)) return false // camelCase identifier
-    if (/^[A-Za-z_]+$/.test(v) && /pass|secret|token|key|cred/i.test(v)) return false // PASSWORD=PASSWORD
-    if (/^(?:true|false|null|none|nil)[,;)]?$/i.test(v)) return false
-  }
-  return true
-}
-
 const NON_SECRET_KEY = /(?:_?(?:count|type|length|len|name|names|id|ids|file|path|dir|url|uri|field|label|hint|policy|prompt|required|expiry|expires|expires_at|ttl|min|max|limit|usage|header|param|env|var|prefix|format|version)|tokens|tokenizer)$/i
-
-const PASSWORD_KEY = /(?:password|passwd|passphrase|passwort|kennwort|pwd)$/i
 
 function validateGeneric(_original, match) {
   const key = match.groups?.key ?? ""
   if (NON_SECRET_KEY.test(key) && !/credentials?$/i.test(key)) return false
   const quoted = match.groups?.secret !== undefined || match.groups?.secret2 !== undefined
   const value = match.groups?.secret ?? match.groups?.secret2 ?? match.groups?.secret3
-  // Prose like "Secrets: Dateien" or "token: Bearer": a short bare word is only
-  // a secret after an explicit password key ("password: sommerwiese").
-  if (!quoted && /^\p{L}{1,11}$/u.test(value ?? "") && !PASSWORD_KEY.test(key)) return false
+  // `apiKey = makeKey(...)`: an unquoted value directly followed by a call is code.
+  if (!quoted && (match.input ?? "")[match.index + match[0].length] === "(") return false
+  // Prose like "Secrets: Dateien": single words (and dummy passwords) are left alone.
   return validateAssignedValue(value, quoted)
 }
 
@@ -83,17 +46,7 @@ function validateUrlPassword(original) {
   return validateAssignedValue(original, true)
 }
 
-/** Shannon entropy in bits per character. */
-export function shannon(s) {
-  const freq = new Map()
-  for (const c of s) freq.set(c, (freq.get(c) ?? 0) + 1)
-  let h = 0
-  for (const n of freq.values()) {
-    const p = n / s.length
-    h -= p * Math.log2(p)
-  }
-  return h
-}
+export { shannon }
 
 /**
  * High-entropy value next to a secret-ish key name. Rejects identifiers,
@@ -113,6 +66,9 @@ export function makeEntropyValidator(opts = {}) {
     if (/\.(?:[cm]?[jt]sx?|json|md|py|go|rs|java|kt|cs|css|s?html?|ya?ml|toml|txt|lock|png|jpe?g|gif|svg|xml|sh|ps1)$/i.test(v)) return false
     if (/^\.{0,2}\//.test(v) || /^[A-Za-z]:[\\/]/.test(v)) return false
     if (v.split(/[-_./+~]/).filter((s) => /^[A-Za-z]{4,}$/.test(s)).length >= 2) return false
+    if (looksLikeIdentifier(v) || looksLikeMemberExpr(v)) return false
+    if ((match?.input ?? "")[match.index + match[0].length] === "(") return false
+    if (DUMMY_FRAGMENT.test(v)) return false
     if (looksLikeReference(v)) return false
     const h = shannon(v)
     if (/^[0-9a-f]+$/i.test(v)) return v.length >= 32 && h >= minHexBits
@@ -172,7 +128,7 @@ function validateIban(original) {
 // A named group `secret` (or `secret2`/`secret3`) limits redaction to the value.
 // ---------------------------------------------------------------------------
 
-const KEY_NAMES = R`password|passwd|passphrase|passwort|kennwort|pwd|secret|api[_\-]?key|apikey|api[_\-]?secret|access[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|id[_\-]?token|client[_\-]?secret|app[_\-]?secret|private[_\-]?key|secret[_\-]?key|encryption[_\-]?key|signing[_\-]?key|master[_\-]?key|connection[_\-]?string|credentials?|token`
+const KEY_NAMES = R`password|passwd|passphrase|passwort|kennwort|pwd|secret|api[_\-]?key|apikey|api[_\-]?secret|access[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|id[_\-]?token|client[_\-]?secret|app[_\-]?secret|private[_\-]?key|secret[_\-]?key|encryption[_\-]?key|signing[_\-]?key|master[_\-]?key|connection[_\-]?string|credentials?|token|psk|wpa[_\-]?(?:passphrase|psk)|pre[_\-]?shared[_\-]?key|wifi[_\-]?password|wlan[_\-]?(?:passwort|key)`
 
 /** @type {Array<[string, {pattern:string, flags?:string, category:string, strong?:boolean, validate?:Function}]>} */
 const SECRET_LIST = [
@@ -217,13 +173,14 @@ const SECRET_LIST = [
   ["url_credentials", { category: "URL_PASSWORD", validate: validateUrlPassword, pattern: R`(?<![A-Za-z0-9+.\-])[a-zA-Z][a-zA-Z0-9+.\-]{1,20}://[^\s:/@'"<>]{1,128}:(?<secret>[^\s/@'"<>]{1,256})@[A-Za-z0-9.\-\[\]_]` }],
   ["auth_header", { category: "AUTH_HEADER", flags: "i", pattern: R`authorization["']?\s*[:=]\s*["']?(?:Basic|Bearer|Token|Digest)\s+(?<secret>[A-Za-z0-9._~+/\-]{8,}=*)` }],
   ["bearer_token", { category: "BEARER_TOKEN", pattern: R`(?<![A-Za-z0-9])Bearer\s+(?<secret>[A-Za-z0-9._~+/\-]{20,}=*)` }],
+  ...CREDENTIAL_RULES,
   [
     "generic_secret",
     {
       category: "SECRET",
       flags: "i",
       validate: validateGeneric,
-      pattern: R`(?<![A-Za-z0-9])(?<key>[A-Za-z0-9_.\-]{0,40}?(?:${KEY_NAMES})[A-Za-z0-9_\-]{0,20})["']?\s*(?:=>|:=|=|:)\s*(?:"(?<secret>[^"\r\n]{4,256})"|'(?<secret2>[^'\r\n]{4,256})'|(?<secret3>[^\s"'${"`"},;{}()<>\[\]]{4,256}))`,
+      pattern: R`(?<![A-Za-z0-9])(?<key>[A-Za-z0-9_.\-]{0,40}?(?:${KEY_NAMES})[A-Za-z0-9_\-]{0,20})["']?\s*(?:=>|:=|=|:)\s*(?:"(?<secret>[^"\r\n]{4,256})"|'(?<secret2>[^'\r\n]{4,256})'|(?<secret3>[^\s"'${"`"},;&{}()<>\[\]]{4,256}))`,
     },
   ],
   [
@@ -263,16 +220,19 @@ function compileRule(id, pattern, flags, category, extra, errors) {
   const peeled = peelInlineFlags(pattern, flags)
   let f = peeled.flags.replace(/[gdy]/g, "")
   f += "g"
-  const hasGroup = /\(\?<secret\d?>/.test(peeled.pattern)
+  const hasGroup = /\(\?<(?:secret|user)\d*>/.test(peeled.pattern)
   if (hasGroup) f += "d"
   try {
     return {
       id,
       regex: new RegExp(peeled.pattern, f),
       category: sanitizeCategory(category),
+      userCategory: sanitizeCategory(extra?.userCategory ?? "LOGIN"),
       hasGroup,
       strong: Boolean(extra?.strong),
       validate: typeof extra?.validate === "function" ? extra.validate : null,
+      userFilter: typeof extra?.userFilter === "function" ? extra.userFilter : null,
+      resolve: typeof extra?.resolve === "function" ? extra.resolve : null,
     }
   } catch (error) {
     errors.push({ pattern: peeled.pattern, flags: f, message: String(error?.message ?? error) })
@@ -356,10 +316,25 @@ export function buildPatternSet(raw, knownEntries = [], opts = {}) {
       wholeWord: Boolean(x.whole_word ?? x.wholeWord),
     })
   }
-  for (const e of knownEntries) keywords.push(e)
+  // Known secrets by match mode: exact (substring), word (whole token), context
+  // (only after a credential key), off (registered but never replaced).
+  const contextEntries = []
+  for (const e of knownEntries) {
+    const mode = e.mode ?? "exact"
+    if (mode === "off") continue
+    if (mode === "context") contextEntries.push(e)
+    else keywords.push(mode === "word" ? { ...e, wholeWord: true } : e)
+  }
+  const ctxSpec = buildContextRule(contextEntries)
+  if (ctxSpec) {
+    const ctxRule = compileRule("known_context", ctxSpec.pattern, ctxSpec.flags, ctxSpec.category, ctxSpec, errors)
+    if (ctxRule) regexRules.unshift(ctxRule)
+  }
 
   return {
-    keywords,
+    // `keywords`: everything the registry knows (named placeholders); `matchKeywords`: literal matching.
+    keywords: [...keywords, ...contextEntries],
+    matchKeywords: keywords,
     keywordMatchers: compileKeywords(keywords),
     regex: opts.strongOnly ? regexRules.filter((r) => r.strong) : regexRules,
     exclude: new Set((Array.isArray(cfg.exclude) ? cfg.exclude : []).map((x) => String(x ?? ""))),

@@ -16,6 +16,18 @@ import { restoreFrame, restoreResponse } from "./stream.js"
 import { ProtectedPaths, compileToolRules, toolEffect } from "./policy.js"
 import { runSelfTest } from "./selftest.js"
 import { expandPath } from "./util.js"
+import { restoreText } from "./restore.js"
+import {
+  FingerprintRegistry,
+  allStrings,
+  compileRouting,
+  deniedSources,
+  endpointFor,
+  sourceAllowed,
+  sourcesForCall,
+  toolNames,
+  urlVerified,
+} from "./routing.js"
 
 const TAG = "[opencode-vibeguard]"
 const REQUEST_KINDS = ["context", "compaction", "generate", "title"]
@@ -154,6 +166,11 @@ export default {
         protected: protectedPaths.list.length,
         failed: res.failed.map((f) => f.file),
       })
+      const weak = res.entries.filter((e) => !e.variant && e.strength === "weak")
+      if (weak.length) {
+        record("secrets.weak", { names: weak.map((e) => e.category), modes: weak.map((e) => e.mode) })
+        log(`${weak.length} weak known secret(s) (only replaced in a credential context): ${weak.map((e) => e.category).join(", ")}`)
+      }
     }
     await rebuild("setup", { refreshSlow: true })
 
@@ -195,6 +212,163 @@ export default {
       })
     })
     const getSession = (id) => store.get(id)
+
+    // ----------------------------------------------------------------- routing
+    const routing = compileRouting(config, directory)
+    const fingerprints = new FingerprintRegistry(deriveKey(master, "fingerprints"))
+    if (routing.enabled && routing.fingerprints) {
+      try {
+        fingerprints.load(await ctx.storage?.get?.("fingerprints"))
+      } catch {
+        // start empty
+      }
+    }
+    let fpTimer = null
+    const saveFingerprints = (now = false) => {
+      if (!fingerprints.dirty) return
+      const write = async () => {
+        fpTimer = null
+        fingerprints.dirty = false
+        try {
+          await ctx.storage?.set?.("fingerprints", fingerprints.toJSON())
+        } catch (error) {
+          record("storage.error", { key: "fingerprints", message: String(error?.message ?? error) })
+        }
+      }
+      if (now) return write()
+      fpTimer ??= setTimeout(write, 1000)
+      fpTimer.unref?.()
+    }
+    /** Last model per session (preflight in execute.before). */
+    const lastModel = new Map()
+    /** Persistent per-session taint: restricted sources a session has seen. */
+    const taints = new Map()
+    const getTaint = async (sid) => {
+      if (!sid) return new Set()
+      let t = taints.get(sid)
+      if (t) return t
+      t = new Set()
+      try {
+        const stored = await ctx.storage?.get?.(`taint:${sid}`)
+        if (Array.isArray(stored)) stored.forEach((s) => t.add(String(s)))
+      } catch {
+        // none
+      }
+      taints.set(sid, t)
+      return t
+    }
+    const addTaint = async (sid, names) => {
+      const t = await getTaint(sid)
+      const before = t.size
+      names.forEach((n) => t.add(n))
+      if (t.size === before) return
+      try {
+        await ctx.storage?.set?.(`taint:${sid}`, [...t])
+      } catch (error) {
+        record("storage.error", { key: "taint", message: String(error?.message ?? error) })
+      }
+    }
+    const clearTaint = async (sid) => {
+      taints.set(sid, new Set())
+      try {
+        await ctx.storage?.remove?.(`taint:${sid}`)
+      } catch {
+        // ignore
+      }
+    }
+    const describeModel = (m) => (m ? `${m.providerID}/${m.id}` : "unknown")
+    const allowList = (name) => {
+      const s = routing.sources.find((x) => x.name === name)
+      return s?.allow ? [...s.allow].join(", ") : "*"
+    }
+
+    /**
+     * Which restricted sources does this request carry that its endpoint may not see?
+     * Signals: tool calls of restricted sources in the history, the session taint,
+     * and fingerprints of restricted content in any string.
+     */
+    const routingViolations = async (event, endpoint) => {
+      const denied = deniedSources(routing, endpoint)
+      if (denied.length === 0) return { violations: [], toolParts: [] }
+      const deniedNames = new Set(denied.map((s) => s.name))
+      const violations = new Map()
+      const toolParts = []
+      const calls = new Map()
+      for (const message of Array.isArray(event.messages) ? event.messages : []) {
+        for (const part of Array.isArray(message?.content) ? message.content : []) {
+          if (part?.type !== "tool-call") continue
+          const names = toolNames(part.name, part.namespace, part.input)
+          const hit = sourcesForCall(routing, names, part.input).filter((n) => deniedNames.has(n))
+          if (hit.length) calls.set(part.id, hit)
+        }
+      }
+      // Only results carry data: a call that was denied (preflight) or failed has none.
+      for (const message of Array.isArray(event.messages) ? event.messages : []) {
+        for (const part of Array.isArray(message?.content) ? message.content : []) {
+          if (part?.type !== "tool-result" || !calls.has(part.id) || part.result?.type === "error") continue
+          toolParts.push({ part, sources: calls.get(part.id) })
+          calls.get(part.id).forEach((n) => violations.set(n, "tool result in history"))
+        }
+      }
+      for (const n of await getTaint(event.sessionID)) {
+        if (deniedNames.has(n) && !violations.has(n)) violations.set(n, "session tainted")
+      }
+      const contentHits = new Map()
+      if (routing.fingerprints && fingerprints.size > 0) {
+        const withheld = new Set(toolParts.map((t) => t.part))
+        const scan = (value, inWithheld) => {
+          for (const s of allStrings(value)) {
+            for (const [src, score] of fingerprints.check(s)) {
+              if (!deniedNames.has(src)) continue
+              const prev = contentHits.get(src) ?? { score: 0, outside: false }
+              contentHits.set(src, { score: prev.score + score, outside: prev.outside || !inWithheld })
+            }
+          }
+        }
+        scan(event.system, false)
+        for (const message of Array.isArray(event.messages) ? event.messages : []) {
+          for (const part of Array.isArray(message?.content) ? message.content : []) scan(part, withheld.has(part))
+        }
+        for (const [src, hit] of contentHits) {
+          if (hit.score >= 2 && !violations.has(src)) violations.set(src, "content fingerprint")
+        }
+      }
+      return {
+        violations: [...violations].map(([source, via]) => ({ source, via })),
+        toolParts,
+        derived: [...contentHits].some(([src, h]) => h.score >= 2 && h.outside && deniedNames.has(src)),
+      }
+    }
+
+    const violationMessage = (violations, model, kind) =>
+      `${TAG} blocked ${kind} request to ${describeModel(model)}: this session contains data from restricted source(s) ` +
+      violations.map((v) => `"${v.source}" (allowed: ${allowList(v.source)}; ${v.via})`).join(", ") +
+      `. Switch the session to an allowed model, or start a new session.`
+
+    /** Trusted endpoint: no substitution at all; placeholders from earlier turns are turned back into real values. */
+    const passthrough = (event) => {
+      const session = getSession(event?.sessionID)
+      if (!session) return 0
+      let restored = 0
+      const stats = createRestoreStats()
+      for (const part of Array.isArray(event.system) ? event.system : []) {
+        if (part?.type === "text" && typeof part.text === "string") part.text = restoreText(part.text, session, stats)
+      }
+      for (const message of Array.isArray(event.messages) ? event.messages : []) {
+        if (typeof message?.content === "string") {
+          message.content = restoreText(message.content, session, stats)
+          continue
+        }
+        for (const part of Array.isArray(message?.content) ? message.content : []) {
+          if (!part || typeof part !== "object") continue
+          if (typeof part.text === "string") part.text = restoreText(part.text, session, stats)
+          if (part.type === "tool-call" && part.input !== undefined) part.input = restoreValue(part.input, session, stats)
+          if (part.type === "tool-result" && part.result !== undefined) part.result = restoreValue(part.result, session, stats)
+        }
+      }
+      restored = stats.restored
+      return restored
+    }
 
     // ---------------------------------------------------------------- outbound
     const redactMedia = (part, red) => {
@@ -278,6 +452,54 @@ export default {
 
     for (const kind of REQUEST_KINDS) {
       await ctx.session.hook(kind, async (event) => {
+        const endpoint = endpointFor(routing, event.model)
+        if (event?.sessionID) lastModel.set(event.sessionID, { model: event.model, endpoint })
+
+        if (routing.enabled) {
+          let verdict
+          try {
+            verdict = await routingViolations(event, endpoint)
+          } catch (error) {
+            record("routing.error", { kind, message: String(error?.message ?? error) })
+            if (config.fail_closed) throw new Error(`${TAG} routing check failed, request blocked (fail_closed): ${String(error?.message ?? error)}`)
+            verdict = { violations: [], toolParts: [] }
+          }
+          if (verdict.violations.length) {
+            const info = {
+              session: event.sessionID,
+              kind,
+              model: describeModel(event.model),
+              endpoint: endpoint?.name ?? null,
+              sources: verdict.violations.map((v) => v.source),
+              via: verdict.violations.map((v) => v.via),
+            }
+            if (kind === "title") {
+              // Title requests may go to a small cloud model: name the session locally instead.
+              event.result = "Session (restricted data)"
+              record("routing.title", info)
+              return
+            }
+            if (routing.onViolation === "withhold" && !verdict.derived && verdict.toolParts.length) {
+              for (const { part, sources } of verdict.toolParts) {
+                part.result = {
+                  type: "text",
+                  value: `[VibeGuard: content withheld. Data from source ${sources.map((s) => `"${s}"`).join(", ")} may only be processed by: ${sources.map(allowList).join(" / ")}]`,
+                }
+              }
+              record("routing.withhold", { ...info, parts: verdict.toolParts.length })
+            } else {
+              record("routing.block", info)
+              throw new Error(violationMessage(verdict.violations, event.model, kind))
+            }
+          }
+        }
+
+        if (endpoint?.trusted) {
+          const restored = passthrough(event)
+          record("passthrough", { session: event.sessionID, kind, endpoint: endpoint.name, restored })
+          return
+        }
+
         if (!healthy() && config.fail_closed) {
           record("request.blocked", { kind, reason: "selftest_failed" })
           throw new Error(`${TAG} self-test failed at startup; requests are blocked (fail_closed). Run /vibeguard test.`)
@@ -299,10 +521,69 @@ export default {
     }
 
     const guardMode = config.guard?.http ?? "redact"
-    if (guardMode !== "off" && guardMode !== false) {
-      await ctx.session.hook("http.request", async (event) => {
-        const session = getSession(event?.sessionID)
-        if (!session || !event.request) return
+    const guardOn = guardMode !== "off" && guardMode !== false
+    const hostOf = (url) => {
+      try {
+        return new URL(url).host
+      } catch {
+        return ""
+      }
+    }
+    await ctx.session.hook("http.request", async (event) => {
+      const session = getSession(event?.sessionID)
+      if (!session || !event.request) return
+      const endpoint = endpointFor(routing, event.model)
+      const urlOk = urlVerified(endpoint, event.request.url)
+      const effective = endpoint && urlOk ? endpoint : null
+      const host = hostOf(event.request.url)
+      const egress = {
+        session: event.sessionID,
+        kind: event.kind,
+        model: describeModel(event.model),
+        host,
+        endpoint: effective?.name ?? null,
+        trusted: Boolean(effective?.trusted),
+      }
+
+      if (endpoint && !urlOk && (endpoint.trusted || routing.enabled)) {
+        // The provider is configured as a local/allowed endpoint but the request goes elsewhere.
+        record("routing.url_mismatch", { ...egress, expected: endpoint.name })
+        if (endpoint.trusted) {
+          throw new Error(`${TAG} blocked: provider "${event.model?.providerID}" is the trusted endpoint "${endpoint.name}", but the request goes to ${host}, which is not in its base_urls.`)
+        }
+      }
+
+      if (routing.enabled) {
+        const denied = deniedSources(routing, effective)
+        if (denied.length) {
+          const deniedNames = new Set(denied.map((s) => s.name))
+          const reasons = []
+          if (routing.onViolation === "block") {
+            for (const n of await getTaint(event.sessionID)) if (deniedNames.has(n)) reasons.push({ source: n, via: "session tainted" })
+          }
+          if (routing.fingerprints && fingerprints.size > 0 && event.request.body) {
+            let json = null
+            try {
+              json = JSON.parse(await event.request.clone().text())
+            } catch {
+              json = null
+            }
+            const score = new Map()
+            for (const s of json ? allStrings(json) : []) for (const [src, n] of fingerprints.check(s)) if (deniedNames.has(src)) score.set(src, (score.get(src) ?? 0) + n)
+            for (const [src, n] of score) if (n >= 2 && !reasons.some((r) => r.source === src)) reasons.push({ source: src, via: "content fingerprint" })
+          }
+          if (reasons.length) {
+            record("routing.block", { ...egress, layer: "http", sources: reasons.map((r) => r.source), via: reasons.map((r) => r.via) })
+            throw new Error(violationMessage(reasons, event.model, event.kind))
+          }
+        }
+      }
+
+      if (effective?.trusted || !guardOn) {
+        record("egress", egress)
+        return
+      }
+      {
         let res
         let body = null
         try {
@@ -322,6 +603,7 @@ export default {
           if (config.fail_closed) throw new Error(`${TAG} payload guard failed, request blocked (fail_closed): ${message}`)
           return
         }
+        record("egress", { ...egress, guard: res.count })
         if (res.count === 0) return
         record("guard", { session: event.sessionID, kind: event.kind, count: res.count, mode: guardMode, paths: res.paths })
         if (guardMode === "block") {
@@ -329,13 +611,15 @@ export default {
         }
         log(`http.request (${event.kind}): safety net replaced ${res.count} fragment(s)`)
         event.request = res.request
-      })
-    }
+      }
+    })
 
     if (config.guard?.websocket !== false) {
       await ctx.session.hook("experimental.ws.send", (event) => {
         const session = getSession(event?.sessionID)
         if (!session || typeof event.frame !== "string") return
+        const endpoint = endpointFor(routing, event.model)
+        if (endpoint?.trusted && urlVerified(endpoint, event.url ?? "")) return
         const res = guardRawText(event.frame, state.raw, session)
         if (!res.count) return
         record("guard.ws", { session: event.sessionID, count: res.count, mode: guardMode })
@@ -388,6 +672,24 @@ export default {
     await ctx.tool.hook("execute.before", async (event) => {
       const session = getSession(event?.sessionID)
       if (!session) return
+
+      // Preflight: do not even fetch restricted data while the session runs on a model that may not see it.
+      if (routing.enabled && routing.preflight) {
+        const sources = sourcesForCall(routing, toolNames(event.tool, null, event.input), event.input)
+        if (sources.length) {
+          const current = lastModel.get(event.sessionID)
+          const blocked = sources.filter((name) => !sourceAllowed(routing.sources.find((s) => s.name === name), current?.endpoint ?? null))
+          if (blocked.length) {
+            record("routing.preflight", { session: event.sessionID, tool: event.tool, sources: blocked, model: describeModel(current?.model) })
+            throw new Error(
+              `${TAG} tool "${event.tool}" reads data from source ${blocked.map((s) => `"${s}"`).join(", ")}, which may only be processed by ` +
+                `${blocked.map(allowList).join(" / ")}. The current model ${describeModel(current?.model)} is not allowed. ` +
+                `Ask the user to switch to an allowed (local) model for this task.`,
+            )
+          }
+        }
+      }
+
       const effect = toolEffect(event.tool, toolRules)
       if (effect === "keep") return
       const scan = scanPlaceholders(event.input, session)
@@ -441,6 +743,31 @@ export default {
       record("tool.restore", { session: event.sessionID, tool: event.tool, count: scan.restored, categories })
     })
 
+    // Source tagging: every tool result from a configured source is audited, tagged in its
+    // metadata, taints the session and (if restricted) is fingerprinted.
+    if (routing.enabled && typeof ctx.tool?.hook === "function") {
+      await ctx.tool.hook("execute.after", async (event) => {
+        if (event?.status !== "completed") return
+        const sources = sourcesForCall(routing, toolNames(event.tool, null, event.input), event.input)
+        if (sources.length === 0) return
+        const restricted = sources.filter((n) => routing.sources.find((s) => s.name === n)?.allow !== null)
+        let fps = 0
+        if (restricted.length && routing.fingerprints) {
+          const strings = allStrings(event.result)
+          for (const src of restricted) for (const s of strings) fps += fingerprints.add(src, s)
+          saveFingerprints()
+        }
+        if (restricted.length) await addTaint(event.sessionID, restricted)
+        record("source.access", { session: event.sessionID, tool: event.tool, sources, restricted, fingerprints: fps })
+        try {
+          const meta = event.result?.metadata && typeof event.result.metadata === "object" ? event.result.metadata : {}
+          event.result = { ...event.result, metadata: { ...meta, vibeguard: { sources } } }
+        } catch {
+          // result shape not taggable
+        }
+      })
+    }
+
     if (ctx.permission?.hook) {
       await ctx.permission.hook("evaluate", (event) => {
         if (event.action === "vibeguard_secret") {
@@ -484,6 +811,16 @@ export default {
         selfTest,
         audit,
         sessions: () => store.size(),
+        routing: {
+          info: routing,
+          getTaint,
+          clearTaint: async (sid) => {
+            await clearTaint(sid)
+            record("taint.clear", { session: sid })
+          },
+          lastModel: (sid) => lastModel.get(sid),
+          fingerprints: () => fingerprints.size,
+        },
       })
       await ctx.command.transform((editor) => {
         editor.add({
@@ -493,7 +830,7 @@ export default {
             const sub = String(input?.prompt?.text ?? "").trim().split(/\s+/)[0] || "status"
             let text
             try {
-              text = await handler.run(input?.prompt?.text ?? "")
+              text = await handler.run(input?.prompt?.text ?? "", { sessionID: input?.sessionID })
             } catch (error) {
               text = `VibeGuard command failed: ${String(error?.message ?? error)}`
             }
@@ -516,8 +853,14 @@ export default {
       selftest: state.selftest?.ok ?? null,
       guard: guardMode,
       restore_response: config.restore?.response !== false,
+      endpoints: routing.endpoints.map((e) => `${e.name}${e.trusted ? " (trusted)" : ""}`),
+      sources: routing.sources.map((s) => `${s.name}${s.allow ? ` -> ${[...s.allow].join("|")}` : ""}`),
     })
     log(`active: prefix=${config.prefix} guard=${guardMode} restore.response=${config.restore?.response !== false}`)
-    return () => store.clear()
+    return async () => {
+      if (fpTimer) clearTimeout(fpTimer)
+      await saveFingerprints(true)
+      store.clear()
+    }
   },
 }
