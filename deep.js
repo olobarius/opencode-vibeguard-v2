@@ -10,7 +10,10 @@ import { isPlainObject, mapStrings } from "./util.js"
 export function redactValue(value, patterns, session, counter) {
   return mapStrings(value, (s) => {
     const res = redactText(s, patterns, session)
-    if (counter && res.count) counter.count += res.count
+    if (counter && res.count) {
+      counter.count += res.count
+      for (const c of res.categories ?? []) counter.categories?.add(c)
+    }
     return res.text
   })
 }

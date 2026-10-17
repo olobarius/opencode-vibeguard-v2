@@ -24,6 +24,21 @@
       // { "name": "GITHUB_PAT", "command": ["pass", "show", "github/token"] },
       // { "name": "VAULT", "command": ["powershell", "-NoProfile", "-Command", "Get-Secret -Name X -AsPlainText"] }
     ],
+    // Windows Credential Manager (Windows only). Default: every generic credential
+    // named "vibeguard:<NAME>" (create them with `/vibeguard add NAME --wincred`).
+    "windows_credentials": [
+      { "filter": "vibeguard:*" }
+      // { "target": "git:https://github.com", "name": "GITHUB_GCM", "include_user": false }
+    ],
+    // KeePass / KeePassXC via keepassxc-cli (default null = off)
+    // "keepass": {
+    //   "database": "~/Documents/secrets.kdbx",
+    //   "password_wincred": "vibeguard-keepass",   // or "password_env": "KEEPASS_PW" / "no_password": true
+    //   "key_file": "~/keys/secrets.keyx",          // optional
+    //   "group": "VibeGuard",                       // all entries in this group (title = name)
+    //   "entries": [{ "name": "DB_PASSWORD", "entry": "Dev/Database" }]
+    // },
+    "store": "file", // where `/vibeguard add` writes: "file" (first secrets file) or "wincred"
     "variants": true, // also match base64 / base64url / URL-encoded forms
     "min_len": 4,
     "reload_interval": "5s" // hot reload when a watched file changes
@@ -44,6 +59,8 @@
     "builtin": ["secrets", "iban", "credit_card"],
     "exclude": ["localhost", "127.0.0.1"],
     "min_secret_len": 8,
+    // `entropy_secret` rule (in "secrets"): random-looking value next to a key-ish name
+    "entropy": { "min_bits": 3.5, "min_hex_bits": 3.0, "min_len": 16 },
     "protected_files": [], // file contents become known secrets and reads are blocked
     "import_deny_paths": false, // also ingest cc-safety-net secret_protection.deny_paths
     "deny_policy": "" // default ~/.cc-safety-net/policy.json
@@ -66,5 +83,15 @@
   },
 
   // Native permission guard: deny `read`, ask on `shell` for registered secret files.
-  "protect": { "reads": true, "shell": "ask", "paths": [] }
+  "protect": { "reads": true, "shell": "ask", "paths": [] },
+
+  // Security event log (JSONL, rotated, never contains values).
+  // Default path: ~/.local/share/opencode/vibeguard/audit.jsonl
+  "audit": { "enabled": true, "path": "", "max_bytes": 5242880, "max_files": 3 },
+
+  // Pipeline self-test at startup (random canaries). A failure blocks requests while fail_closed is on.
+  "selftest": true,
+
+  // Slash command /vibeguard (status, add, remove, reload, test, audit)
+  "command": { "enabled": true, "name": "vibeguard", "mask_chars": 2 }
 }

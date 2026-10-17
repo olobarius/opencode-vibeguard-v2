@@ -3,7 +3,9 @@ import { readFile, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { sanitizeCategory } from "./patterns.js"
+import { keepassSecrets } from "./keepass.js"
 import { loadProtectedKeywords, readDenyPaths } from "./secrets.js"
+import { windowsCredentialSecrets } from "./wincred.js"
 import { expandPath, globToRegex, isPlainObject, stripBom } from "./util.js"
 
 const SENSITIVE_ENV =
@@ -132,7 +134,7 @@ export function secretVariants(value) {
  * Order defines naming precedence when the same value appears in several sources.
  * @returns {Promise<{ entries: Array<{value:string,category:string}>, watch: string[], failed: Array<{file:string,message:string}>, protectedPaths: string[], counts: Record<string, number> }>}
  */
-export async function collectKnownSecrets(config, directory) {
+export async function collectKnownSecrets(config, directory, opts = {}) {
   const secrets = config.secrets ?? {}
   const patterns = config.patterns ?? {}
   const watch = []
@@ -142,7 +144,7 @@ export async function collectKnownSecrets(config, directory) {
   const all = []
   const push = (source, list) => {
     counts[source] = (counts[source] ?? 0) + list.length
-    all.push(...list)
+    for (const e of list) all.push({ ...e, source: e.source ?? source })
   }
 
   // 1. Dedicated secrets lists (named, explicit). Bare lines are passwords/terms.
@@ -182,12 +184,32 @@ export async function collectKnownSecrets(config, directory) {
     push("opencode_auth", (await opencodeAuthSecrets(authFiles)).entries)
   }
 
-  // 5. Password manager commands (run once per load).
-  if (Array.isArray(secrets.commands) && secrets.commands.length > 0) {
-    const res = await commandSecrets(secrets.commands)
-    push("commands", res.entries)
-    failed.push(...res.failed)
+  // 5. Slow external sources: password-manager commands, Windows Credential Manager,
+  //    KeePass. Cached between hot reloads; refreshed at setup and `/vibeguard reload`.
+  let slow = opts.slowCache
+  if (!slow || opts.refreshSlow) {
+    slow = { commands: [], windows_credentials: [], keepass: [], failed: [] }
+    if (Array.isArray(secrets.commands) && secrets.commands.length > 0) {
+      const res = await commandSecrets(secrets.commands)
+      slow.commands = res.entries
+      slow.failed.push(...res.failed)
+    }
+    if (process.platform === "win32" && Array.isArray(secrets.windows_credentials) && secrets.windows_credentials.length > 0) {
+      const res = await (opts.wincred ?? windowsCredentialSecrets)(secrets.windows_credentials)
+      slow.windows_credentials = res.entries
+      slow.failed.push(...res.failed)
+    }
+    if (secrets.keepass?.database) {
+      const res = await keepassSecrets(secrets.keepass, directory)
+      slow.keepass = res.entries
+      slow.failed.push(...res.failed)
+    }
   }
+  push("windows_credentials", slow.windows_credentials)
+  push("keepass", slow.keepass)
+  push("commands", slow.commands)
+  failed.push(...slow.failed)
+  if (secrets.keepass?.database) protectedPaths.push(expandPath(secrets.keepass.database, directory))
 
   const exclude = new Set((Array.isArray(patterns.exclude) ? patterns.exclude : []).map(String))
   const seen = new Set()
@@ -195,19 +217,20 @@ export async function collectKnownSecrets(config, directory) {
   for (const e of all) {
     if (!e?.value || seen.has(e.value) || exclude.has(e.value)) continue
     seen.add(e.value)
-    entries.push({ value: e.value, category: sanitizeCategory(e.category) })
+    entries.push({ value: e.value, category: sanitizeCategory(e.category), source: e.source })
   }
+  const named = entries.length
   if (secrets.variants !== false) {
-    for (const e of [...entries]) {
+    for (const e of entries.slice(0, named)) {
       for (const [variant, suffix] of secretVariants(e.value)) {
         if (seen.has(variant)) continue
         seen.add(variant)
-        entries.push({ value: variant, category: `${e.category}_${suffix}` })
+        entries.push({ value: variant, category: `${e.category}_${suffix}`, source: e.source, variant: true })
       }
     }
   }
   counts.total = entries.length
-  return { entries, watch: [...new Set(watch)], failed, protectedPaths: [...new Set(protectedPaths)], counts }
+  return { entries, named, watch: [...new Set(watch)], failed, protectedPaths: [...new Set(protectedPaths)], counts, slow }
 }
 
 /** Cheap change detection for hot reload. */

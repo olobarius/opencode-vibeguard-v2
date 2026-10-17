@@ -2,25 +2,29 @@ import { appendFileSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createAudit } from "./audit.js"
+import { createCommandHandler } from "./command.js"
 import { loadConfig } from "./config.js"
 import { buildPatternSet } from "./patterns.js"
 import { KnownRegistry, PlaceholderSession, createSessionStore, deriveKey } from "./session.js"
-import { collectKnownSecrets, fingerprint } from "./known.js"
+import { collectKnownSecrets, defaultDataDir, fingerprint } from "./known.js"
 import { redactText } from "./engine.js"
 import { redactValue } from "./deep.js"
 import { createRestoreStats, restoreValue, scanPlaceholders } from "./restore.js"
 import { buildRawPatterns, guardRawText, guardRequest } from "./guard.js"
 import { restoreFrame, restoreResponse } from "./stream.js"
 import { ProtectedPaths, compileToolRules, toolEffect } from "./policy.js"
+import { runSelfTest } from "./selftest.js"
 import { expandPath } from "./util.js"
 
 const TAG = "[opencode-vibeguard]"
 const REQUEST_KINDS = ["context", "compaction", "generate", "title"]
 const TEXT_MEDIA = /^(?:text\/|application\/(?:json|xml|yaml|x-yaml|toml|x-sh|javascript|typescript|x-ndjson))/i
+const HINT_MARKER = "Privacy notice: secrets, passwords"
 
 /**
- * Trace for hook wiring diagnostics (`debug: true` or OPENCODE_VIBEGUARD_DEBUG).
- * JSON lines in `<tmpdir>/opencode-vibeguard-trace.log`. Counts only, never values.
+ * Debug trace (`debug: true` or OPENCODE_VIBEGUARD_DEBUG): JSON lines in
+ * `<tmpdir>/opencode-vibeguard-trace.log`. Counts only, never values.
  */
 function createTrace(enabled) {
   if (!enabled) return () => {}
@@ -36,7 +40,7 @@ function createTrace(enabled) {
 
 function systemHint(prefix) {
   return (
-    `Privacy notice: secrets, passwords and other sensitive values in this conversation are replaced by placeholders ` +
+    `${HINT_MARKER} and other sensitive values in this conversation are replaced by placeholders ` +
     `of the form ${prefix}<NAME>_<12 hex chars>__ . Treat each placeholder exactly like the real value: use it verbatim ` +
     `in tool calls, shell commands and file edits; it is substituted locally right before execution. Never guess, decode, ` +
     `shorten, alter or invent placeholders, and do not ask the user to reveal the underlying values. Some tools ` +
@@ -55,7 +59,7 @@ async function loadMasterKey(ctx) {
   try {
     await ctx.storage?.set?.("master-key", key.toString("hex"))
   } catch {
-    // ephemeral key: placeholders change after a restart
+    // ephemeral key: known placeholders change after a restart
   }
   return key
 }
@@ -64,14 +68,16 @@ async function loadMasterKey(ctx) {
  * VibeGuard for OpenCode V2.
  *
  * Outbound (nothing sensitive reaches the provider):
- * - session hooks context/compaction/generate/title: structural redaction of system, messages, tool calls/results
- * - session hook http.request (+ experimental.ws.send): raw payload safety net for known values and strong rules
+ * - session hooks context/compaction/generate/title: structural redaction
+ * - session hook http.request (+ experimental.ws.send): raw payload safety net
  * - session hook prompt (opt-in): redact the user prompt before it is persisted
  *
  * Inbound / local:
- * - session hook http.response (+ experimental.ws.receive): restore placeholders in model text
- * - tool hook execute.before: restore real values for local tools, with a per-tool allow/ask/deny/keep policy
- * - permission hook evaluate: block reading files whose contents are registered secrets
+ * - session hook http.response (+ experimental.ws.receive): restore placeholders in answer text
+ * - tool hook execute.before: restore real values for local tools (allow / ask / deny / keep)
+ * - permission hook evaluate: block reading registered secret files
+ *
+ * Operations: `/vibeguard` command, JSONL audit log, startup self-test, live pipeline check.
  */
 export default {
   id: "opencode-vibeguard",
@@ -80,6 +86,18 @@ export default {
     const config = await loadConfig(directory, ctx.options)
     const debug = Boolean(process.env.OPENCODE_VIBEGUARD_DEBUG) || config.debug
     const trace = createTrace(debug)
+    const auditCfg = config.audit ?? {}
+    const audit = createAudit({
+      enabled: config.enabled && auditCfg.enabled !== false,
+      path: auditCfg.path ? expandPath(auditCfg.path, directory) : join(defaultDataDir(), "vibeguard", "audit.jsonl"),
+      maxBytes: auditCfg.max_bytes,
+      maxFiles: auditCfg.max_files,
+    })
+    /** Security event: audit log (always) + debug trace. Never pass secret values. */
+    const record = (type, data = {}) => {
+      audit.write(type, data)
+      trace(type, data)
+    }
     const log = (...args) => {
       if (debug) console.log(TAG, ...args)
     }
@@ -97,24 +115,60 @@ export default {
     const known = new KnownRegistry({ prefix: config.prefix, key: deriveKey(master, "known") })
     const protectedPaths = new ProtectedPaths([], directory)
     const toolRules = compileToolRules(config.restore.tools)
-    const state = { patterns: null, raw: null, watch: [], fp: "", checkedAt: Date.now() }
+    const state = {
+      patterns: null,
+      raw: null,
+      known: null,
+      watch: [],
+      fp: "",
+      checkedAt: Date.now(),
+      selftest: null,
+      pipeline: "",
+      protectedCount: 0,
+      pipelineChecked: new Set(),
+    }
 
-    async function rebuild(reason) {
-      const res = await collectKnownSecrets(config, directory)
+    async function rebuild(reason, opts = {}) {
+      const res = await collectKnownSecrets(config, directory, {
+        slowCache: state.known?.slow,
+        refreshSlow: opts.refreshSlow ?? !state.known,
+      })
       const patterns = buildPatternSet(config.patterns, res.entries)
       known.load(patterns.keywords)
       state.patterns = patterns
       state.raw = buildRawPatterns(patterns, config.guard?.regex ?? "strong")
+      state.known = res
       state.watch = res.watch
       state.fp = await fingerprint(res.watch)
       const extra = (Array.isArray(config.protect?.paths) ? config.protect.paths : []).map((p) => expandPath(p, directory))
       protectedPaths.set([...res.protectedPaths, ...extra])
+      state.protectedCount = protectedPaths.list.length
       for (const e of patterns.errors) console.error(`${TAG} skipped invalid rule /${e.pattern}/${e.flags}: ${e.message}`)
       for (const f of res.failed) console.error(`${TAG} secret source unreadable: ${f.file}: ${f.message}`)
-      log(`${reason}: ${known.size} known value(s) (${JSON.stringify(res.counts)}), ${patterns.regex.length} rule(s), ${protectedPaths.list.length} protected path(s)`)
-      trace("load", { reason, counts: res.counts, rules: patterns.regex.length, protected: protectedPaths.list.length })
+      log(`${reason}: ${res.named} known value(s) (${JSON.stringify(res.counts)}), ${patterns.regex.length} rule(s), ${protectedPaths.list.length} protected path(s)`)
+      record("load", {
+        reason,
+        named: res.named,
+        counts: res.counts,
+        rules: patterns.regex.length,
+        protected: protectedPaths.list.length,
+        failed: res.failed.map((f) => f.file),
+      })
     }
-    await rebuild("setup")
+    await rebuild("setup", { refreshSlow: true })
+
+    const selfTest = () => {
+      const res = runSelfTest(config)
+      state.selftest = res
+      const failed = res.checks.filter((c) => !c.ok)
+      record("selftest", { ok: res.ok, failed: failed.filter((c) => !c.warn).map((c) => c.name), warnings: failed.filter((c) => c.warn).map((c) => c.name) })
+      for (const c of failed) {
+        console.error(`${TAG} self-test ${c.warn ? "warning" : "FAILED"}: ${c.name} (${c.detail})`)
+      }
+      return res
+    }
+    if (config.selftest !== false) selfTest()
+    const healthy = () => config.selftest === false || state.selftest?.ok !== false
 
     let reloading = null
     const fresh = () => {
@@ -155,19 +209,19 @@ export default {
       const after = red(text)
       if (after === text) return
       const data = source.type === "base64" ? Buffer.from(after, "utf8").toString("base64") : new Uint8Array(Buffer.from(after, "utf8"))
-      const next = Object.assign(Object.create(Object.getPrototypeOf(media)), media, { source: { ...source, data } })
-      part.media = next
+      part.media = Object.assign(Object.create(Object.getPrototypeOf(media)), media, { source: { ...source, data } })
     }
 
     const redactRequest = (event, kind) => {
       const session = getSession(event?.sessionID)
-      if (!session) return 0
+      if (!session) return { count: 0, categories: [] }
       session.cleanup()
       const patterns = state.patterns
-      const counter = { count: 0 }
+      const counter = { count: 0, categories: new Set() }
       const red = (s) => {
         const r = redactText(s, patterns, session)
         counter.count += r.count
+        for (const c of r.categories ?? []) counter.categories.add(c)
         return r.text
       }
 
@@ -219,21 +273,25 @@ export default {
       if (config.system_hint && kind !== "title" && Array.isArray(event.system)) {
         event.system.push({ type: "text", text: systemHint(config.prefix) })
       }
-      return counter.count
+      return { count: counter.count, categories: [...counter.categories] }
     }
 
     for (const kind of REQUEST_KINDS) {
       await ctx.session.hook(kind, async (event) => {
+        if (!healthy() && config.fail_closed) {
+          record("request.blocked", { kind, reason: "selftest_failed" })
+          throw new Error(`${TAG} self-test failed at startup; requests are blocked (fail_closed). Run /vibeguard test.`)
+        }
         try {
           await fresh()
-          const count = redactRequest(event, kind)
-          if (count > 0) {
-            log(`${kind}: redacted ${count} fragment(s)`)
-            trace("request", { kind, count })
+          const res = redactRequest(event, kind)
+          if (res.count > 0) {
+            log(`${kind}: redacted ${res.count} fragment(s)`)
+            record("redact", { session: event.sessionID, kind, count: res.count, categories: res.categories })
           }
         } catch (error) {
           const message = String(error?.message ?? error)
-          trace("request.error", { kind, message })
+          record("redact.error", { kind, message })
           if (config.fail_closed) throw new Error(`${TAG} redaction failed, request blocked (fail_closed): ${message}`)
           console.error(`${TAG} redaction failed (request sent unredacted!): ${message}`)
         }
@@ -246,16 +304,26 @@ export default {
         const session = getSession(event?.sessionID)
         if (!session || !event.request) return
         let res
+        let body = null
         try {
           res = await guardRequest(event.request, state.raw, session, debug ? state.patterns : undefined)
+          // Live pipeline check: the structural hooks must have run for agent-loop requests.
+          if (config.system_hint && event.kind === "primary" && !state.pipelineChecked.has(event.sessionID)) {
+            body = await event.request.clone().text()
+            const ok = body.includes(HINT_MARKER)
+            state.pipelineChecked.add(event.sessionID)
+            state.pipeline = ok ? "✅ verified" : "❌ structural redaction did not run"
+            record("pipeline", { session: event.sessionID, ok })
+            if (!ok) console.error(`${TAG} live check: the structural redaction hooks did not run for this request.`)
+          }
         } catch (error) {
           const message = String(error?.message ?? error)
-          trace("http.request.error", { message })
+          record("guard.error", { message })
           if (config.fail_closed) throw new Error(`${TAG} payload guard failed, request blocked (fail_closed): ${message}`)
           return
         }
         if (res.count === 0) return
-        trace("http.request", { kind: event.kind, count: res.count, mode: guardMode, paths: res.paths })
+        record("guard", { session: event.sessionID, kind: event.kind, count: res.count, mode: guardMode, paths: res.paths })
         if (guardMode === "block") {
           throw new Error(`${TAG} blocked ${event.kind} request: ${res.count} secret fragment(s) found in the raw payload`)
         }
@@ -270,7 +338,7 @@ export default {
         if (!session || typeof event.frame !== "string") return
         const res = guardRawText(event.frame, state.raw, session)
         if (!res.count) return
-        trace("ws.send", { count: res.count })
+        record("guard.ws", { session: event.sessionID, count: res.count, mode: guardMode })
         if (guardMode === "block") throw new Error(`${TAG} blocked websocket frame: ${res.count} secret fragment(s)`)
         event.frame = res.text
       })
@@ -289,7 +357,7 @@ export default {
         for (const file of Array.isArray(event.prompt.files) ? event.prompt.files : []) {
           if (file && typeof file === "object" && "mention" in file) delete file.mention
         }
-        trace("prompt", { count: res.count })
+        record("redact.prompt", { session: event.sessionID, count: res.count, categories: res.categories })
       })
     }
 
@@ -305,7 +373,7 @@ export default {
           event.response = next
           trace("http.response", { kind: event.kind, type: next.headers.get("content-type") })
         } catch (error) {
-          trace("http.response.error", { message: String(error?.message ?? error) })
+          record("restore.error", { message: String(error?.message ?? error) })
         }
       })
       await ctx.session.hook("experimental.ws.receive", (event) => {
@@ -326,7 +394,7 @@ export default {
       if (scan.restored === 0 && scan.unknown.size === 0) return
 
       if (scan.unknown.size > 0 && config.restore?.unknown !== "keep") {
-        trace("tool.unknown", { tool: event.tool, count: scan.unknown.size })
+        record("tool.unknown_placeholder", { session: event.sessionID, tool: event.tool, placeholders: [...scan.unknown].slice(0, 5) })
         throw new Error(
           `${TAG} the input of tool "${event.tool}" contains placeholder(s) that cannot be resolved in this session: ` +
             `${[...scan.unknown].slice(0, 5).join(", ")}. Never invent or modify placeholders; use them exactly as they ` +
@@ -337,7 +405,7 @@ export default {
 
       const categories = [...scan.categories]
       if (effect === "deny") {
-        trace("tool.deny", { tool: event.tool, categories })
+        record("tool.deny", { session: event.sessionID, tool: event.tool, categories })
         throw new Error(
           `${TAG} tool "${event.tool}" is not allowed to receive secret values (${categories.join(", ")}). ` +
             `Do not send secrets to this tool; use a local tool instead or ask the user.`,
@@ -347,23 +415,30 @@ export default {
         const key = `${event.sessionID}\0${event.tool}`
         if (!approved.has(key)) {
           if (typeof ctx.permission?.assert !== "function") {
+            record("tool.deny", { session: event.sessionID, tool: event.tool, categories, reason: "no_permission_api" })
             throw new Error(`${TAG} tool "${event.tool}" needs approval to receive secrets, but permission prompts are unavailable.`)
           }
-          await ctx.permission.assert({
-            sessionID: event.sessionID,
-            agent: event.agent,
-            action: "vibeguard_secret",
-            resources: categories.map((c) => `${event.tool}:${c}`),
-            source: { type: "tool", messageID: event.messageID, id: event.id },
-            metadata: { tool: event.tool, secrets: categories },
-          })
+          try {
+            await ctx.permission.assert({
+              sessionID: event.sessionID,
+              agent: event.agent,
+              action: "vibeguard_secret",
+              resources: categories.map((c) => `${event.tool}:${c}`),
+              source: { type: "tool", messageID: event.messageID, id: event.id },
+              metadata: { tool: event.tool, secrets: categories },
+            })
+          } catch (error) {
+            record("tool.ask", { session: event.sessionID, tool: event.tool, categories, approved: false })
+            throw error
+          }
           approved.add(key)
+          record("tool.ask", { session: event.sessionID, tool: event.tool, categories, approved: true })
         }
       }
 
       event.input = restoreValue(event.input, session)
       log(`execute.before ${event.tool}: restored ${scan.restored} placeholder(s)`)
-      trace("tool.restore", { tool: event.tool, count: scan.restored })
+      record("tool.restore", { session: event.sessionID, tool: event.tool, count: scan.restored, categories })
     })
 
     if (ctx.permission?.hook) {
@@ -382,7 +457,7 @@ export default {
             if (!hit) continue
             event.effect = "deny"
             event.message = `VibeGuard: "${resource}" is a registered secret file; reading it into the conversation is blocked.`
-            trace("protect.read", { action: event.action })
+            record("protect.read", { session: event.sessionID, path: resource })
             return
           }
         }
@@ -392,13 +467,56 @@ export default {
             if (!hit) continue
             event.effect = protect.shell === "deny" ? "deny" : "ask"
             event.message = `VibeGuard: this command references the registered secret file "${hit}".`
-            trace("protect.shell", { effect: event.effect })
+            record("protect.shell", { session: event.sessionID, effect: event.effect, path: hit })
             return
           }
         }
       })
     }
 
+    // ------------------------------------------------------------- operations
+    if (config.command?.enabled !== false && ctx.command?.transform) {
+      const handler = createCommandHandler({
+        config,
+        directory,
+        getState: () => state,
+        rebuild,
+        selfTest,
+        audit,
+        sessions: () => store.size(),
+      })
+      await ctx.command.transform((editor) => {
+        editor.add({
+          name: handler.name,
+          description: "VibeGuard: status, add/remove secrets (clipboard), reload, self-test, audit log",
+          execute: async (input) => {
+            const sub = String(input?.prompt?.text ?? "").trim().split(/\s+/)[0] || "status"
+            let text
+            try {
+              text = await handler.run(input?.prompt?.text ?? "")
+            } catch (error) {
+              text = `VibeGuard command failed: ${String(error?.message ?? error)}`
+            }
+            try {
+              await ctx.session.synthetic({ sessionID: input.sessionID, text, description: "VibeGuard", resume: false })
+              record("command", { session: input.sessionID, sub })
+            } catch (error) {
+              const message = String(error?.message ?? error)
+              record("command.error", { session: input.sessionID, sub, message })
+              console.error(`${TAG} could not post command output: ${message}`)
+            }
+          },
+        })
+      })
+    }
+
+    record("active", {
+      directory,
+      config: config.loadedFrom,
+      selftest: state.selftest?.ok ?? null,
+      guard: guardMode,
+      restore_response: config.restore?.response !== false,
+    })
     log(`active: prefix=${config.prefix} guard=${guardMode} restore.response=${config.restore?.response !== false}`)
     return () => store.clear()
   },

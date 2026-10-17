@@ -96,12 +96,12 @@ export function redactText(input, patterns, session, opts) {
   const useCache = opts?.cache !== false
 
   const cached = useCache ? session.cacheGet?.(text, patterns) : undefined
-  if (cached !== undefined) return { text: cached.text, count: cached.count }
+  if (cached !== undefined) return { text: cached.text, count: cached.count, categories: cached.categories ?? [] }
 
   const planned = findMatches(text, patterns, session.placeholderRe)
   if (planned.length === 0) {
-    if (useCache) session.cacheSet?.(text, patterns, text, 0)
-    return { text, count: 0 }
+    if (useCache) session.cacheSet?.(text, patterns, text, 0, [])
+    return { text, count: 0, categories: [] }
   }
 
   let out = ""
@@ -115,6 +115,7 @@ export function redactText(input, patterns, session, opts) {
     cur = m.end
   }
   out += text.slice(cur)
-  if (useCache) session.cacheSet?.(text, patterns, out, planned.length)
-  return { text: out, count: planned.length }
+  const categories = [...new Set(planned.map((m) => m.category))]
+  if (useCache) session.cacheSet?.(text, patterns, out, planned.length, categories)
+  return { text: out, count: planned.length, categories }
 }

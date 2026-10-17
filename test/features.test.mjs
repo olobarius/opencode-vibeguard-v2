@@ -34,7 +34,7 @@ function tmp() {
   return mkdtempSync(join(tmpdir(), "vg-feat-"))
 }
 
-const quiet = { files: [], env: false, opencode_auth: false }
+const quiet = { files: [], env: false, opencode_auth: false, windows_credentials: [] }
 
 // --------------------------------------------------------------- detection
 
@@ -62,6 +62,12 @@ test("rules: generic assignments redact only the value", () => {
   assert.match(out, /^DB_PASSWORD="__VG_SECRET_[a-f0-9]{12}__"$/)
 })
 
+test("rules: bare word after a password key is still a secret", () => {
+  const p = buildPatternSet({})
+  const out = redactText("wlan password: sommerwiese", p, session()).text
+  assert.match(out, /^wlan password: __VG_SECRET_[a-f0-9]{12}__$/)
+})
+
 test("rules: generic assignments ignore code and config noise", () => {
   const p = buildPatternSet({})
   const s = session()
@@ -74,6 +80,8 @@ test("rules: generic assignments ignore code and config noise", () => {
     "token: process.env.TOKEN",
     'secret: "<your-secret-here>"',
     "PASSWORD=PASSWORD",
+    "Bekannte Secrets: Dateien, Env",
+    "API key: required",
   ]) {
     assert.equal(redactText(line, p, s).text, line, line)
   }
@@ -93,6 +101,10 @@ test("rules: iban and credit card need valid checksums", () => {
   assert.ok(redactText("IBAN DE00 3704 0044 0532 0130 00", p, s).text.includes("DE00"))
   assert.ok(!redactText("card 4111 1111 1111 1111", p, s).text.includes("4111"))
   assert.ok(redactText("order 1234 5678 9012 3456", p, s).text.includes("1234"))
+  // Luhn-valid epoch-ms timestamps are not cards (no issuer prefix)
+  const ts = ["1792242613000", "1792242613001", "1792242613002", "1792242613003", "1792242613004", "1792242613005", "1792242613006", "1792242613007", "1792242613008", "1792242613009"]
+  for (const t of ts) assert.ok(redactText(`"created":${t}`, p, s).text.includes(t), t)
+  assert.ok(!redactText("amex 3782 822463 10005", p, s).text.includes("3782"))
 })
 
 // ----------------------------------------------------------- known values
@@ -358,7 +370,7 @@ function mockCtx(dir, hooks, extra = {}) {
 async function setupPlugin(config, extra) {
   const dir = tmp()
   writeFileSync(join(dir, "vibeguard.secrets"), `GITHUB_PAT=${GH}\n`)
-  writeFileSync(join(dir, "vibeguard.config.json"), JSON.stringify({ enabled: true, ...config }))
+  writeFileSync(join(dir, "vibeguard.config.json"), JSON.stringify({ enabled: true, audit: { path: join(dir, "audit.jsonl") }, ...config }))
   const hooks = new Map()
   await plugin.setup(mockCtx(dir, hooks, extra))
   return { dir, hooks }

@@ -1,12 +1,17 @@
 {
   "name": "opencode-vibeguard-v2",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "VibeGuard for OpenCode V2 (2.0.32+): secrets and PII reach the LLM only as __VG_...__ placeholders; real values are restored locally for tools and in the streamed answer",
   "type": "module",
   "exports": "./index.js",
   "files": [
     "index.js",
+    "audit.js",
+    "command.js",
     "config.js",
+    "keepass.js",
+    "selftest.js",
+    "wincred.js",
     "deep.js",
     "engine.js",
     "guard.js",

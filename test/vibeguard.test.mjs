@@ -17,7 +17,12 @@ const EXCLUDED_EMAIL = ["excluded", "example.org"].join("@")
 
 function makeConfigDir(config) {
   const dir = mkdtempSync(join(tmpdir(), "vibeguard-test-"))
-  writeFileSync(join(dir, "vibeguard.config.json"), JSON.stringify(config))
+  const isolated = {
+    audit: { enabled: false },
+    secrets: { files: [], env: false, opencode_auth: false, windows_credentials: [] },
+    ...config,
+  }
+  writeFileSync(join(dir, "vibeguard.config.json"), JSON.stringify(isolated))
   return dir
 }
 

@@ -173,7 +173,7 @@ export class PlaceholderSession {
     return hit
   }
 
-  cacheSet(text, patterns, out, count) {
+  cacheSet(text, patterns, out, count, categories) {
     if (text.length < CACHE_MIN_CHARS) return
     if (this.cachePatterns !== patterns) {
       this.cache.clear()
@@ -187,7 +187,7 @@ export class PlaceholderSession {
       this.cache.delete(k)
       this.cacheChars -= k.length + (v.text === k ? 0 : v.text.length)
     }
-    this.cache.set(text, { text: out, count })
+    this.cache.set(text, { text: out, count, categories })
     this.cacheChars += size
   }
 

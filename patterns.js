@@ -65,17 +65,61 @@ function validateAssignedValue(value, quoted) {
 
 const NON_SECRET_KEY = /(?:_?(?:count|type|length|len|name|names|id|ids|file|path|dir|url|uri|field|label|hint|policy|prompt|required|expiry|expires|expires_at|ttl|min|max|limit|usage|header|param|env|var|prefix|format|version)|tokens|tokenizer)$/i
 
+const PASSWORD_KEY = /(?:password|passwd|passphrase|passwort|kennwort|pwd)$/i
+
 function validateGeneric(_original, match) {
   const key = match.groups?.key ?? ""
   if (NON_SECRET_KEY.test(key) && !/credentials?$/i.test(key)) return false
   const quoted = match.groups?.secret !== undefined || match.groups?.secret2 !== undefined
   const value = match.groups?.secret ?? match.groups?.secret2 ?? match.groups?.secret3
+  // Prose like "Secrets: Dateien" or "token: Bearer": a short bare word is only
+  // a secret after an explicit password key ("password: sommerwiese").
+  if (!quoted && /^\p{L}{1,11}$/u.test(value ?? "") && !PASSWORD_KEY.test(key)) return false
   return validateAssignedValue(value, quoted)
 }
 
 function validateUrlPassword(original) {
   if (/^\d{1,5}$/.test(original)) return false
   return validateAssignedValue(original, true)
+}
+
+/** Shannon entropy in bits per character. */
+export function shannon(s) {
+  const freq = new Map()
+  for (const c of s) freq.set(c, (freq.get(c) ?? 0) + 1)
+  let h = 0
+  for (const n of freq.values()) {
+    const p = n / s.length
+    h -= p * Math.log2(p)
+  }
+  return h
+}
+
+/**
+ * High-entropy value next to a secret-ish key name. Rejects identifiers,
+ * paths, file names, UUIDs and word-like values; hex needs >= 32 chars.
+ */
+export function makeEntropyValidator(opts = {}) {
+  const minBits = Number.isFinite(opts.min_bits) ? opts.min_bits : 3.5
+  const minHexBits = Number.isFinite(opts.min_hex_bits) ? opts.min_hex_bits : 3.0
+  const minLen = Number.isFinite(opts.min_len) ? opts.min_len : 16
+  return (original, match) => {
+    const v = String(original ?? "")
+    if (v.length < minLen || v.includes("__VG_")) return false
+    const key = match?.groups?.key ?? ""
+    if (NON_SECRET_KEY.test(key) && !/credentials?$/i.test(key)) return false
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return false
+    if (/^[A-Za-z]+$/.test(v) || /^[\d.\-]+$/.test(v)) return false
+    if (/\.(?:[cm]?[jt]sx?|json|md|py|go|rs|java|kt|cs|css|s?html?|ya?ml|toml|txt|lock|png|jpe?g|gif|svg|xml|sh|ps1)$/i.test(v)) return false
+    if (/^\.{0,2}\//.test(v) || /^[A-Za-z]:[\\/]/.test(v)) return false
+    if (v.split(/[-_./+~]/).filter((s) => /^[A-Za-z]{4,}$/.test(s)).length >= 2) return false
+    if (looksLikeReference(v)) return false
+    const h = shannon(v)
+    if (/^[0-9a-f]+$/i.test(v)) return v.length >= 32 && h >= minHexBits
+    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(v)).length
+    if (classes < 2 || !/[0-9]/.test(v)) return false
+    return h >= minBits
+  }
 }
 
 function luhn(digits) {
@@ -93,9 +137,23 @@ function luhn(digits) {
   return sum % 10 === 0
 }
 
+// Issuer prefix + allowed lengths (Visa, Mastercard, Amex, Discover, Diners, JCB, Maestro, UnionPay).
+const CARD_IIN = [
+  [/^4/, [13, 16, 19]],
+  [/^(?:5[1-5]|2(?:2[2-9][1-9]|2[3-9]\d|[3-6]\d\d|7[01]\d|720))/, [16]],
+  [/^3[47]/, [15]],
+  [/^(?:6011|65|64[4-9])/, [16, 17, 18, 19]],
+  [/^3(?:0[0-5]|[68])/, [14, 15, 16, 17, 18, 19]],
+  [/^35(?:2[89]|[3-8]\d)/, [16, 17, 18, 19]],
+  [/^(?:5[06-9]|6[37])/, [12, 13, 14, 15, 16, 17, 18, 19]],
+  [/^62/, [16, 17, 18, 19]],
+]
+
 function validateCard(original) {
   const d = original.replace(/[ -]/g, "")
-  return d.length >= 13 && d.length <= 19 && luhn(d)
+  if (d.length < 13 || d.length > 19) return false
+  if (!CARD_IIN.some(([re, lens]) => re.test(d) && lens.includes(d.length))) return false
+  return luhn(d)
 }
 
 function validateIban(original) {
@@ -166,6 +224,17 @@ const SECRET_LIST = [
       flags: "i",
       validate: validateGeneric,
       pattern: R`(?<![A-Za-z0-9])(?<key>[A-Za-z0-9_.\-]{0,40}?(?:${KEY_NAMES})[A-Za-z0-9_\-]{0,20})["']?\s*(?:=>|:=|=|:)\s*(?:"(?<secret>[^"\r\n]{4,256})"|'(?<secret2>[^'\r\n]{4,256})'|(?<secret3>[^\s"'${"`"},;{}()<>\[\]]{4,256}))`,
+    },
+  ],
+  [
+    // Broader key context (also `--token VALUE`, `x-auth: VALUE`, `stripeKey`), but only
+    // for random-looking values: Shannon entropy + character-class checks.
+    "entropy_secret",
+    {
+      category: "HIGH_ENTROPY_SECRET",
+      flags: "i",
+      entropy: true,
+      pattern: R`(?<![A-Za-z0-9])(?<key>-{0,2}[A-Za-z0-9_.\-]{0,40}?(?:key|auth|sig|signature|pass|pwd|cred|secret|token|license|private|salt|cookie|bearer)[A-Za-z0-9_\-]{0,20})["']?(?:\s*(?:=>|:=|=|:)\s*|[ \t]+)["']?(?<secret>[A-Za-z0-9+/=_\-.~]{16,256})(?![A-Za-z0-9+/=_\-.~])`,
     },
   ],
 ]
@@ -270,7 +339,8 @@ export function buildPatternSet(raw, knownEntries = [], opts = {}) {
       errors.push({ pattern: name, flags: "", message: "unknown builtin" })
       continue
     }
-    const compiled = compileRule(name, rule.pattern, rule.flags, rule.category, rule, errors)
+    const extra = rule.entropy ? { ...rule, validate: makeEntropyValidator(cfg.entropy) } : rule
+    const compiled = compileRule(name, rule.pattern, rule.flags, rule.category, extra, errors)
     if (compiled && !regexRules.some((r) => r.id === name)) regexRules.push(compiled)
   }
 

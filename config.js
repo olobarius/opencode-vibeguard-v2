@@ -20,6 +20,8 @@ export const DEFAULTS = Object.freeze({
     regex: [],
     exclude: [],
     min_secret_len: 8,
+    // Thresholds for the `entropy_secret` rule (part of the default "secrets" group).
+    entropy: { min_bits: 3.5, min_hex_bits: 3.0, min_len: 16 },
     protected_files: [],
     import_deny_paths: false,
     deny_policy: "",
@@ -30,10 +32,22 @@ export const DEFAULTS = Object.freeze({
     env: true,
     opencode_auth: true,
     commands: [],
+    // Windows Credential Manager (Windows only): generic credentials `vibeguard:<NAME>`.
+    windows_credentials: [{ filter: "vibeguard:*" }],
+    // KeePass/KeePassXC via keepassxc-cli: { database, password_env | password_wincred | no_password, entries, group }
+    keepass: null,
+    // Where `/vibeguard add` stores new secrets: file | wincred
+    store: "file",
     variants: true,
     min_len: 4,
     reload_interval: "5s",
   },
+  // Security event log (JSONL, rotated). Never contains secret values.
+  audit: { enabled: true, path: "", max_bytes: 5 * 1024 * 1024, max_files: 3 },
+  // Pipeline self-test at startup; failure blocks requests when fail_closed is on.
+  selftest: true,
+  // `/vibeguard` slash command.
+  command: { enabled: true, name: "vibeguard", mask_chars: 2 },
   // Last line of defence on the raw provider payload.
   guard: { http: "redact", websocket: true, regex: "strong" },
   restore: {
